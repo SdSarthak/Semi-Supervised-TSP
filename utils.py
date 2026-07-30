@@ -2,25 +2,51 @@
 Utility functions for Semi-Supervised TSP Visualizer
 """
 
+import json
+import os
+import time
+from typing import Tuple, List, Optional, Sequence, Union
+
 import numpy as np
-from typing import Tuple, List, Optional
 from scipy.spatial.distance import cdist
 from scipy.spatial import cKDTree
-import time
+
+# Points are generated inside the unit square with this much margin, so a
+# tour never sits exactly on the plot border.
+COORD_MIN = 0.02
+COORD_MAX = 0.98
+
+SeedLike = Optional[Union[int, np.random.Generator]]
+
+
+def as_generator(seed: SeedLike = None) -> np.random.Generator:
+    """Coerce a seed (or an existing Generator) into a numpy Generator.
+
+    Using a local generator keeps the helpers below free of global
+    ``np.random`` side effects, so seeding one call never silently pins the
+    randomness of unrelated code that runs afterwards.
+    """
+    if isinstance(seed, np.random.Generator):
+        return seed
+    return np.random.default_rng(seed)
+
 
 class Timer:
     """Simple timer context manager"""
-    def __init__(self, name: str = "Operation"):
+    def __init__(self, name: str = "Operation", verbose: bool = True):
         self.name = name
+        self.verbose = verbose
         self.start_time = None
-        
+        self.elapsed = 0.0
+
     def __enter__(self):
-        self.start_time = time.time()
+        self.start_time = time.perf_counter()
         return self
-        
+
     def __exit__(self, *args):
-        elapsed = time.time() - self.start_time
-        print(f"{self.name} took {elapsed:.3f} seconds")
+        self.elapsed = time.perf_counter() - self.start_time
+        if self.verbose:
+            print(f"{self.name} took {self.elapsed:.3f} seconds")
 
 class SpatialIndex:
     """Spatial indexing for efficient nearest neighbor queries"""
@@ -44,14 +70,171 @@ def euclidean_distance_matrix(points1: np.ndarray, points2: np.ndarray) -> np.nd
     return cdist(points1, points2, metric='euclidean')
 
 def tour_length(tour: np.ndarray) -> float:
-    """Calculate total length of a tour"""
-    if len(tour) < 2:
+    """Calculate total length of a closed tour given as an array of points"""
+    tour = np.asarray(tour, dtype=float)
+    if tour.size == 0 or len(tour) < 2:
         return 0.0
-    
+
     # Add first point at the end to close the loop
     closed_tour = np.vstack([tour, tour[0]])
     distances = np.sqrt(np.sum(np.diff(closed_tour, axis=0)**2, axis=1))
-    return np.sum(distances)
+    return float(np.sum(distances))
+
+
+def tour_length_of_indices(points: np.ndarray, tour: Sequence[int]) -> float:
+    """Length of a closed tour expressed as an ordering of point indices"""
+    points = np.asarray(points, dtype=float)
+    order = np.asarray(tour, dtype=int)
+    if order.size < 2:
+        return 0.0
+    return tour_length(points[order])
+
+
+def is_valid_tour(tour: Sequence[int], n_points: int) -> bool:
+    """True when ``tour`` visits every index in ``range(n_points)`` exactly once"""
+    order = np.asarray(tour, dtype=int)
+    if order.shape != (n_points,):
+        return False
+    return bool(np.array_equal(np.sort(order), np.arange(n_points)))
+
+
+def project_points_onto_loop(points: np.ndarray, loop: np.ndarray,
+                             chunk_size: int = 2048) -> Tuple[np.ndarray, np.ndarray]:
+    """Project points onto a closed polyline.
+
+    For every point this finds the closest location on the closed loop and
+    returns how far along the loop that location sits (arc length from the
+    first vertex) together with the distance from the point to the loop.
+
+    Args:
+        points: ``(n, 2)`` array of data points.
+        loop: ``(m, 2)`` array of loop vertices; the loop is implicitly closed.
+        chunk_size: number of points handled per vectorised block, which caps
+            peak memory at roughly ``chunk_size * m`` floats.
+
+    Returns:
+        ``(arc_positions, distances)``, both of shape ``(n,)``.
+    """
+    points = np.asarray(points, dtype=float)
+    loop = np.asarray(loop, dtype=float)
+
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError("points must be an (n, 2) array")
+    if loop.ndim != 2 or loop.shape[1] != 2:
+        raise ValueError("loop must be an (m, 2) array")
+    if len(loop) < 2:
+        raise ValueError("loop must contain at least two vertices")
+    if len(points) == 0:
+        return np.empty(0), np.empty(0)
+
+    starts = loop
+    segments = np.roll(loop, -1, axis=0) - loop
+    segment_lengths = np.linalg.norm(segments, axis=1)
+    segment_lengths_sq = np.maximum(segment_lengths ** 2, 1e-18)
+
+    # Arc length at the start of each segment.
+    arc_offsets = np.concatenate([[0.0], np.cumsum(segment_lengths)[:-1]])
+
+    arc_positions = np.empty(len(points))
+    distances = np.empty(len(points))
+
+    for begin in range(0, len(points), max(chunk_size, 1)):
+        block = points[begin:begin + max(chunk_size, 1)]
+        offsets = block[:, None, :] - starts[None, :, :]          # (b, m, 2)
+        t = np.einsum('bmk,mk->bm', offsets, segments) / segment_lengths_sq
+        np.clip(t, 0.0, 1.0, out=t)
+        closest = starts[None, :, :] + t[:, :, None] * segments[None, :, :]
+        block_distances = np.linalg.norm(block[:, None, :] - closest, axis=2)
+
+        best = np.argmin(block_distances, axis=1)
+        rows = np.arange(len(block))
+        arc_positions[begin:begin + len(block)] = (
+            arc_offsets[best] + t[rows, best] * segment_lengths[best]
+        )
+        distances[begin:begin + len(block)] = block_distances[rows, best]
+
+    return arc_positions, distances
+
+
+def order_points_along_loop(points: np.ndarray, loop: np.ndarray) -> np.ndarray:
+    """Turn a continuous loop into a genuine TSP tour over the data points.
+
+    The loop produced by the association or clustering solvers is a smooth
+    curve threading the data, not a permutation of the points. Ordering the
+    points by where they project onto that curve converts the curve into a
+    tour that visits every input point exactly once, which is what makes the
+    loop-based solvers comparable with the permutation solvers.
+
+    Points that project to the same spot are broken apart by distance to the
+    loop so the ordering is deterministic.
+
+    Returns:
+        ``(n,)`` array of point indices in visiting order.
+    """
+    points = np.asarray(points, dtype=float)
+    if len(points) <= 2:
+        return np.arange(len(points))
+
+    arc_positions, distances = project_points_onto_loop(points, loop)
+    return np.lexsort((distances, arc_positions))
+
+
+def two_opt_refine(points: np.ndarray, tour: Sequence[int],
+                   max_passes: int = 50, min_gain: float = 1e-12) -> np.ndarray:
+    """Improve a closed tour with 2-opt segment reversals.
+
+    Each candidate move is scored from the four endpoint distances it changes
+    rather than by re-measuring the whole tour, which keeps a full sweep at
+    ``O(n^2)`` instead of ``O(n^3)``.
+
+    Args:
+        points: ``(n, 2)`` array of point coordinates.
+        tour: ordering of point indices.
+        max_passes: maximum number of improvement sweeps.
+        min_gain: smallest improvement worth applying, guarding against
+            float noise driving an endless loop.
+
+    Returns:
+        ``(n,)`` array with the (possibly improved) ordering.
+    """
+    points = np.asarray(points, dtype=float)
+    order = np.asarray(tour, dtype=int).copy()
+    n = len(order)
+    if n < 4:
+        return order
+
+    improved = True
+    passes = 0
+
+    while improved and passes < max_passes:
+        improved = False
+        passes += 1
+
+        for i in range(n - 2):
+            a = order[i]
+            b = order[i + 1]
+            # Reversing order[i+1:j+1] replaces edges (a, b) and (c, d)
+            # with (a, c) and (b, d).
+            j = np.arange(i + 2, n if i > 0 else n - 1)
+            if j.size == 0:
+                continue
+
+            c = order[j]
+            d = order[(j + 1) % n]
+
+            removed = (np.linalg.norm(points[a] - points[b])
+                       + np.linalg.norm(points[c] - points[d], axis=1))
+            added = (np.linalg.norm(points[a] - points[c], axis=1)
+                     + np.linalg.norm(points[b] - points[d], axis=1))
+            gains = removed - added
+
+            best = int(np.argmax(gains))
+            if gains[best] > min_gain:
+                cut = int(j[best])
+                order[i + 1:cut + 1] = order[i + 1:cut + 1][::-1]
+                improved = True
+
+    return order
 
 def smooth_loop(vertices: np.ndarray, alpha: float, iterations: int = 1) -> np.ndarray:
     """Apply Laplacian smoothing to a closed loop with multiple iterations"""
@@ -143,56 +326,84 @@ def resample_curve(curve: np.ndarray, n_points: int) -> np.ndarray:
     
     return np.array(resampled)
 
-def generate_clustered_points(n_points: int, n_clusters: int = 5, 
-                            cluster_std: float = 0.05, 
-                            uniform_ratio: float = 0.6) -> np.ndarray:
-    """Generate a mix of clustered and uniform random points"""
-    np.random.seed(42)  # For reproducibility
-    
+def generate_clustered_points(n_points: int, n_clusters: int = 5,
+                              cluster_std: float = 0.05,
+                              uniform_ratio: float = 0.6,
+                              seed: SeedLike = None) -> np.ndarray:
+    """Generate a mix of clustered and uniform random points.
+
+    Args:
+        n_points: total number of points to produce.
+        n_clusters: number of Gaussian blobs to draw the clustered share from.
+        cluster_std: standard deviation of each blob.
+        uniform_ratio: fraction of points drawn uniformly instead of clustered.
+        seed: seed or Generator for reproducible output. ``None`` gives fresh
+            randomness without touching the global numpy RNG.
+    """
+    if n_points < 0:
+        raise ValueError("n_points must be non-negative")
+    if not 0.0 <= uniform_ratio <= 1.0:
+        raise ValueError("uniform_ratio must be in [0, 1]")
+    if n_points == 0:
+        return np.empty((0, 2))
+
+    rng = as_generator(seed)
+
     n_uniform = int(n_points * uniform_ratio)
     n_clustered = n_points - n_uniform
-    
+
     points = []
-    
+
     # Generate clustered points
     if n_clustered > 0:
+        n_clusters = max(1, min(n_clusters, n_clustered))
         points_per_cluster = n_clustered // n_clusters
         remainder = n_clustered % n_clusters
-        
+
         for i in range(n_clusters):
             n_cluster_points = points_per_cluster + (1 if i < remainder else 0)
             if n_cluster_points > 0:
                 # Random cluster center
-                center = np.random.uniform(0.2, 0.8, size=2)
-                cluster_points = center + cluster_std * np.random.randn(n_cluster_points, 2)
+                center = rng.uniform(0.2, 0.8, size=2)
+                cluster_points = center + cluster_std * rng.standard_normal((n_cluster_points, 2))
                 points.append(cluster_points)
-    
+
     # Generate uniform points
     if n_uniform > 0:
-        uniform_points = np.random.rand(n_uniform, 2)
-        points.append(uniform_points)
-    
+        points.append(rng.random((n_uniform, 2)))
+
     # Combine and clip to valid range
     all_points = np.vstack(points) if points else np.empty((0, 2))
-    all_points = np.clip(all_points, 0.02, 0.98)
-    
-    return all_points
+    return np.clip(all_points, COORD_MIN, COORD_MAX)
 
-def init_circular_loop(n_vertices: int, center: Tuple[float, float] = (0.5, 0.5), 
-                      radius: float = 0.35, noise_std: float = 0.02) -> np.ndarray:
-    """Initialize a noisy circular loop"""
-    angles = np.linspace(0, 2*np.pi, n_vertices, endpoint=False)
-    r = radius + noise_std * np.random.randn(n_vertices)
-    
+
+def init_circular_loop(n_vertices: int, center: Tuple[float, float] = (0.5, 0.5),
+                       radius: float = 0.35, noise_std: float = 0.02,
+                       seed: SeedLike = None) -> np.ndarray:
+    """Initialize a noisy circular loop.
+
+    Args:
+        n_vertices: number of loop vertices.
+        center: loop centre in unit-square coordinates.
+        radius: nominal loop radius.
+        noise_std: magnitude of the radial and positional jitter.
+        seed: seed or Generator for reproducible output.
+    """
+    if n_vertices < 3:
+        raise ValueError("a loop needs at least three vertices")
+
+    rng = as_generator(seed)
+
+    angles = np.linspace(0, 2 * np.pi, n_vertices, endpoint=False)
+    r = radius + noise_std * rng.standard_normal(n_vertices)
+
     xs = center[0] + r * np.cos(angles)
     ys = center[1] + r * np.sin(angles)
     vertices = np.column_stack([xs, ys])
-    
+
     # Add random jitter
-    vertices += noise_std * np.random.randn(n_vertices, 2)
-    vertices = np.clip(vertices, 0.02, 0.98)
-    
-    return vertices
+    vertices += noise_std * rng.standard_normal((n_vertices, 2))
+    return np.clip(vertices, COORD_MIN, COORD_MAX)
 
 def calculate_adaptive_vertex_count(data_points: np.ndarray, min_vertices: int = 60, 
                                    max_vertices: int = 300, density_factor: float = 0.4) -> int:
@@ -334,38 +545,86 @@ def adaptive_parameters(iteration: int, total_iterations: int,
     
     return move_rate, smooth_rate
 
-def export_data(vertices: np.ndarray, points: np.ndarray, 
-                filename: str, tour_length_val: float) -> None:
-    """Export tour data to file"""
-    import json
-    import os
-    
-    # Create exports directory if it doesn't exist
-    os.makedirs(os.path.dirname(filename), exist_ok=True)
-    
+def export_data(vertices: np.ndarray, points: np.ndarray,
+                filename: str, tour_length_val: float,
+                tour: Optional[Sequence[int]] = None,
+                algorithm: Optional[str] = None) -> str:
+    """Export tour data to a JSON file.
+
+    Args:
+        vertices: loop or tour vertices in visiting order.
+        points: the data points the tour was built for.
+        filename: destination path; parent directories are created as needed.
+        tour_length_val: length of the exported tour.
+        tour: optional ordering of point indices, when the solver produced one.
+        algorithm: optional name of the solver that produced the result.
+
+    Returns:
+        The path written to.
+    """
+    # A bare filename has no directory component, and os.makedirs("") raises.
+    parent = os.path.dirname(os.path.abspath(filename))
+    os.makedirs(parent, exist_ok=True)
+
     data = {
-        'vertices': vertices.tolist(),
-        'points': points.tolist(),
-        'tour_length': tour_length_val,
+        'vertices': np.asarray(vertices, dtype=float).tolist(),
+        'points': np.asarray(points, dtype=float).tolist(),
+        'tour_length': float(tour_length_val),
         'n_vertices': len(vertices),
         'n_points': len(points),
-        'timestamp': time.time()
+        'timestamp': time.time(),
     }
-    
-    with open(filename, 'w') as f:
+    if tour is not None:
+        data['tour'] = [int(i) for i in tour]
+    if algorithm is not None:
+        data['algorithm'] = algorithm
+
+    with open(filename, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2)
-    
+
     print(f"Data exported to {filename}")
+    return filename
+
 
 def load_data(filename: str) -> Tuple[np.ndarray, np.ndarray, float]:
-    """Load tour data from file"""
-    import json
-    
-    with open(filename, 'r') as f:
+    """Load tour data previously written by :func:`export_data`"""
+    with open(filename, 'r', encoding='utf-8') as f:
         data = json.load(f)
-    
-    vertices = np.array(data['vertices'])
-    points = np.array(data['points'])
-    tour_length_val = data['tour_length']
-    
+
+    if not isinstance(data, dict):
+        raise ValueError(f"{filename} does not contain a TSP solution object")
+
+    missing = [key for key in ('vertices', 'points') if key not in data]
+    if missing:
+        raise ValueError(f"{filename} is missing required field(s): {', '.join(missing)}")
+
+    vertices = np.asarray(data['vertices'], dtype=float)
+    points = np.asarray(data['points'], dtype=float)
+    tour_length_val = float(data.get('tour_length', tour_length(vertices)))
+
     return vertices, points, tour_length_val
+
+
+def load_points(filename: str) -> np.ndarray:
+    """Load a set of 2-D points from a JSON, CSV or whitespace-delimited file"""
+    extension = os.path.splitext(filename)[1].lower()
+
+    if extension == '.json':
+        with open(filename, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            if 'points' not in data:
+                raise ValueError(f"{filename} has no 'points' field")
+            points = np.asarray(data['points'], dtype=float)
+        else:
+            points = np.asarray(data, dtype=float)
+    elif extension == '.csv':
+        points = np.loadtxt(filename, delimiter=',', dtype=float)
+    else:
+        points = np.loadtxt(filename, dtype=float)
+
+    points = np.atleast_2d(points)
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError(f"{filename} must contain two columns of coordinates")
+
+    return points
