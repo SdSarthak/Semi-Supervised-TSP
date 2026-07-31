@@ -1,293 +1,269 @@
 # Semi-Supervised TSP Visualizer
 
-An advanced, interactive visualization tool for solving the Traveling Salesman Problem (TSP) using multiple algorithms including semi-supervised approaches.
+An interactive tool for solving and visualising the Traveling Salesman Problem
+with six algorithms, including a semi-supervised "elastic loop" approach that
+fits a continuous curve to the data and reads the tour off it.
 
-## 🚀 Features
+![Association algorithm: the fitted loop and the tour it induces](demo_tsp_solution.png)
 
-### Multiple TSP Algorithms
-- **Association-based**: Iterative vertex-to-point assignment with smoothing
-- **K-means Clustering**: Cluster points then solve TSP on cluster centers  
-- **Nearest Neighbor**: Classic greedy TSP heuristic
-- **2-Opt**: Local search optimization
-- **Genetic Algorithm**: Evolutionary approach with crossover and mutation
-- **Simulated Annealing**: Probabilistic optimization with cooling schedule
+## The idea
 
-### Interactive Interfaces
-- **GUI Mode**: Real-time interactive controls with sliders and buttons
-- **CLI Mode**: Command-line interface for batch processing and automation
-- **Simple Mode**: Quick visualization and comparison
+Most TSP heuristics search directly over permutations of the cities. The
+association solver in this project does something different: it fits a closed
+elastic loop to the point cloud, the way a self-organising map fits a manifold.
 
-### Advanced Features
-- **Real-time Visualization**: Watch algorithms evolve in real-time
-- **Performance Metrics**: Track convergence, tour length, and execution time
-- **Algorithm Comparison**: Side-by-side performance analysis
-- **Data Export/Import**: Save and load solutions in JSON format
-- **Video Export**: Save animations as MP4 videos
-- **Adaptive Parameters**: Algorithm parameters that adjust during execution
-- **Convergence Detection**: Automatic stopping when solution stabilizes
+1. Start with a noisy circle of vertices.
+2. Assign every data point to its nearest loop vertex.
+3. Pull each vertex toward the centroid of the points that chose it.
+4. Relax the loop with curvature-aware Laplacian smoothing.
+5. Repeat, decaying both the attraction and the smoothing.
 
-### Performance Optimizations
-- **Spatial Indexing**: Efficient nearest neighbor queries using k-d trees
-- **Batch Processing**: Optimized for large datasets
-- **Memory Management**: Efficient array operations with NumPy
-- **Parallel-Ready**: Modular design for future parallelization
+The result is a smooth curve threading the data (left panel above). Ordering
+the data points by where they project onto that curve turns it into a genuine
+tour that visits every point exactly once (right panel).
 
-## 📦 Installation
+**The distinction matters for measurement.** The fitted loop is *shorter* than
+any tour of the points, because it does not have to pass through them — it just
+has to run near them. Reporting the loop's length as if it were a tour length
+would flatter the loop-based solvers against every other algorithm. So each
+solver exposes two things:
 
-### Requirements
+- `solve_loop(points)` — the geometry to draw.
+- `solve_tour(points)` — an ordering of the input point indices.
+
+Comparisons always score `solve_tour`, so all six algorithms are measured on
+the same quantity.
+
+## Algorithms
+
+| Algorithm | Approach |
+|-----------|----------|
+| `nearest_neighbor` | Greedy construction; the baseline everything else is measured against |
+| `two_opt` | Greedy start, then 2-opt segment reversals with delta evaluation |
+| `genetic` | Order crossover (OX) and swap mutation over a population of tours |
+| `simulated_annealing` | 2-opt reversal proposals with a temperature calibrated to the data |
+| `association` | Elastic loop fitted to the data, tour read off by projection |
+| `clustering` | k-means centres ordered greedily, resampled into a finer loop |
+
+### Measured performance
+
+Mean over three seeds at 200 points, as a percentage of the greedy
+nearest-neighbour tour length (lower is better). Reproduce with
+`python cli.py compare <algorithms> --points 200`.
+
+| Algorithm | Tour vs greedy | Time (200 pts) |
+|-----------|---------------:|---------------:|
+| `two_opt` | 83% | 0.09s |
+| `simulated_annealing` | 85% | 5.01s |
+| `association` | 89% | 0.27s |
+| `clustering` | 99% | 0.14s |
+| `nearest_neighbor` | 100% | 0.00s |
+| `genetic` | 100% | 0.32s |
+
+Two honest notes on these numbers:
+
+- **`genetic` does not currently beat greedy.** Plain OX crossover with heavy
+  elitism converges prematurely; raising the generation count to 500 only
+  reaches ~97%. It needs a better local-search hybrid to be competitive.
+- **`association` is not the fastest route to a short tour** — `two_opt` is
+  both quicker and shorter. Its appeal is that the intermediate states are a
+  smooth, continuously deforming curve, which is what makes it worth watching.
+
+Any tour can be polished afterwards with `--refine`, which applies 2-opt to the
+result. That brings `association` to roughly the same quality as `two_opt`.
+
+## Installation
+
+Python 3.8 or newer.
+
 ```bash
-pip install numpy matplotlib scikit-learn scipy
-```
-
-### Optional Dependencies
-```bash
-# For video export
-pip install ffmpeg-python
-
-# For enhanced GUI
-pip install tkinter
-```
-
-### Quick Start
-```bash
-# Clone or download the project
-git clone <repository-url>
+git clone https://github.com/SdSarthak/Semi-Supervised-TSP.git
 cd Semi-Supervised-TSP
 
-# Run with default settings
-python main.py
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
 
-# Launch interactive GUI
-python main.py --mode gui
-
-# Compare algorithms
-python main.py --compare association nearest_neighbor genetic --points 100
+pip install -r requirements.txt
 ```
 
-## 🎮 Usage Examples
+For the test suite and linter:
 
-### Interactive GUI
 ```bash
+pip install -r requirements-dev.txt
+```
+
+### Data
+
+There is no dataset to download. Point sets are generated on demand — a mix of
+Gaussian clusters and uniform noise in the unit square — and are reproducible
+from a seed:
+
+```bash
+python cli.py generate --points 200 --output points.json
+```
+
+You can also bring your own points as a JSON file (`{"points": [[x, y], ...]}`),
+a two-column CSV, or a whitespace-delimited text file, and pass it with
+`--input`.
+
+### Optional: video export
+
+Saving an animation as MP4 requires **ffmpeg** on your `PATH`. Without it, use a
+`.gif` filename and matplotlib falls back to its bundled Pillow writer.
+
+## Usage
+
+### Quick start
+
+```bash
+# Solve and plot
+python main.py --algorithm association --points 200
+
+# Compare every algorithm on the same points
+python main.py --compare nearest_neighbor two_opt association clustering --points 200
+
+# Interactive GUI
 python main.py --mode gui
 ```
-- Real-time parameter adjustment with sliders
-- Algorithm switching with radio buttons
-- Start/pause/reset controls
-- Export solutions and videos
 
-### Command Line Interface
+### Command line
+
 ```bash
-# Solve with specific algorithm
+# Solve with a specific algorithm and save the result
 python cli.py solve association --points 200 --output solution.json
 
-# Compare multiple algorithms
+# Compare, several runs each to expose the spread of the stochastic solvers
 python cli.py compare nearest_neighbor two_opt genetic --points 100 --runs 5
 
-# Create animation video
+# Polish every tour with 2-opt before reporting
+python cli.py --refine compare association clustering --points 200
+
+# Benchmark across problem sizes, writing the numbers out as JSON
+python cli.py benchmark nearest_neighbor two_opt --sizes 50 100 200 --output bench.json
+
+# Render an animation
 python cli.py animate association --points 150 --output animation.mp4
-
-# Benchmark performance
-python cli.py benchmark nearest_neighbor two_opt --sizes 50 100 200 300
 ```
 
-### Simple Visualization
-```bash
-# Quick solve and display
-python main.py --algorithm genetic --points 150
+`main.py --mode cli` forwards everything after it to the same interface, so
+`python main.py --mode cli solve two_opt --points 40` works too.
 
-# Animated solution
-python main.py --algorithm association --points 200 --animate
+### Python API
 
-# Save animation video
-python main.py --algorithm association --animate --save-video tsp_evolution.mp4
+```python
+from algorithms import get_algorithm
+from utils import generate_clustered_points
 
-# Compare algorithms without GUI
-python main.py --compare association clustering nearest_neighbor --points 100
+points = generate_clustered_points(200, n_clusters=5, seed=42)
+
+solver = get_algorithm('association', n_vertices=80, seed=42)
+solution = solver.evaluate(points, refine=True)
+
+solution.tour          # ordering of point indices
+solution.tour_points   # the points in visiting order
+solution.length        # tour length over all points
+solution.loop          # the fitted loop, for plotting
+solution.loop_length   # loop length (shorter -- it need not pass through points)
+solution.runtime
 ```
 
-## 🔧 Configuration
+### Headless machines
 
-### Config File (`config.py`)
-Customize algorithm parameters, visualization settings, and performance options:
+Nothing imports a GUI toolkit at import time. The matplotlib backend is chosen
+when something actually draws, falling back to the non-interactive `Agg`
+writer, so `cli.py`, the test suite and the demo all run over SSH or in CI. Set
+`MPLBACKEND=Agg` to skip the toolkit probe entirely.
+
+## Configuration
+
+`config.py` holds the defaults. Three settings can be overridden through the
+environment (see `.env.example`):
+
+| Variable | Meaning |
+|----------|---------|
+| `TSP_SEED` | Default seed for data generation and the stochastic solvers |
+| `TSP_EXPORT_DIR` | Where solutions, plots and videos are written |
+| `MPLBACKEND` | Matplotlib backend override |
+
+Notable algorithm parameters:
 
 ```python
 class Config:
-    # Data generation
-    N_POINTS = 300
-    N_CLUSTERS_DATA = 5
-    
-    # Algorithm parameters  
-    N_VERTICES = 80
-    INITIAL_MOVE_RATE = 0.25
-    INITIAL_SMOOTH_RATE = 0.4
-    
-    # Animation settings
-    STEPS = 600
-    INTERVAL_MS = 50
-    
-    # Convergence detection
-    CONVERGENCE_THRESHOLD = 1e-6
-    CONVERGENCE_WINDOW = 10
+    N_VERTICES = 120            # loop resolution for the association solver
+    INITIAL_MOVE_RATE = 0.25    # attraction toward assigned centroids
+    INITIAL_SMOOTH_RATE = 0.4   # Laplacian smoothing strength
+    MIN_SMOOTH_RATE = 0.0       # smoothing must decay for the loop to sharpen
+    STEPS = 600                 # association iterations / animation frames
+
+    SA_INITIAL_TEMP = None      # None calibrates the schedule to the data
 ```
 
-### Algorithm-Specific Parameters
+`SA_INITIAL_TEMP = None` is deliberate. A fixed temperature is meaningless
+without knowing the coordinate scale: on the unit square a tour edge is about
+0.05 long, so the old default of 1000 accepted every proposal and turned
+annealing into a random walk. Left as `None`, the solver anchors the starting
+temperature to the mean edge length of its initial tour.
 
-#### Association Algorithm
-- `n_vertices`: Number of loop vertices (default: 80)
-- `max_iterations`: Maximum iterations (default: 600)
-- Move rate and smoothing adapt automatically over time
+## Testing
 
-#### Genetic Algorithm
-- `population_size`: Population size (default: 100)
-- `generations`: Number of generations (default: 50)
-- `mutation_rate`: Mutation probability (default: 0.02)
-- `elite_size`: Number of elite individuals (default: 20)
-
-#### Simulated Annealing
-- `initial_temp`: Starting temperature (default: 1000)
-- `cooling_rate`: Temperature decay rate (default: 0.995)
-- `min_temp`: Minimum temperature (default: 1e-8)
-
-## 📊 Algorithm Details
-
-### Association-Based Algorithm
-1. Initialize circular loop of vertices
-2. Assign each data point to nearest vertex
-3. Move vertices toward centroid of assigned points
-4. Apply Laplacian smoothing to maintain loop structure
-5. Repeat until convergence
-
-### K-means Clustering Approach
-1. Perform k-means clustering on data points
-2. Extract cluster centers
-3. Solve TSP on cluster centers using nearest neighbor
-4. Optional: Interpolate more vertices along the path
-
-### Optimization Algorithms
-- **2-Opt**: Iteratively improve tour by swapping edge pairs
-- **Genetic**: Evolve population of tours using crossover and mutation
-- **Simulated Annealing**: Accept worse solutions probabilistically with cooling
-
-## 📈 Performance Analysis
-
-### Benchmarking
 ```bash
-# Test scaling with problem size
-python cli.py benchmark nearest_neighbor two_opt genetic --sizes 50 100 200 500
-
-# Compare solution quality
-python cli.py compare association clustering nearest_neighbor two_opt --runs 10
+python -m pytest              # or: python test_suite.py
 ```
 
-### Metrics Tracked
-- **Tour Length**: Total distance of the solution
-- **Convergence Rate**: How quickly algorithm stabilizes
-- **Execution Time**: Algorithm runtime
-- **Solution Quality**: Comparison across algorithms
+82 tests, all deterministic and offline — no dataset download, no display
+required. They cover:
 
-### Typical Performance
-| Algorithm | Speed | Quality | Use Case |
-|-----------|-------|---------|----------|
-| Nearest Neighbor | Very Fast | Poor | Quick approximation |
-| Association | Fast | Good | Smooth visualization |
-| K-means Clustering | Fast | Good | Data with natural clusters |
-| 2-Opt | Medium | Better | Improved solutions |
-| Genetic | Slow | Good | Global optimization |
-| Simulated Annealing | Slow | Good | Avoiding local minima |
+- Loop projection and the tour it induces
+- 2-opt refinement (never lengthens a tour; untangles a crossed one)
+- The contract that every solver returns a valid permutation of the points
+- Reproducibility from a fixed seed
+- Config validation and JSON/CSV round trips
+- End-to-end runs of every CLI subcommand
 
-## 🎨 Visualization Features
+## Project structure
 
-### Real-time Animation
-- Watch algorithm evolution step-by-step
-- Adjustable animation speed
-- Pause/resume functionality
-- Progress indicators
-
-### Multiple Plot Types
-- **Main Plot**: Points, tour, and vertices
-- **Metrics Plot**: Tour length over time  
-- **Convergence Plot**: Algorithm convergence rate
-
-### Export Options
-- **Static Images**: PNG, PDF, SVG formats
-- **Animated Videos**: MP4 with customizable quality
-- **Data Export**: JSON format with complete solution data
-
-## 🧪 Testing
-
-### Run Test Suite
-```bash
-python test_suite.py
+```
+├── config.py            # Configuration and validation
+├── backend.py           # Matplotlib backend selection
+├── utils.py             # Geometry, projection, refinement, file IO
+├── algorithms.py        # The six solvers and the shared solver interface
+├── main.py              # Simple mode entry point
+├── cli.py               # Batch interface (solve/compare/animate/benchmark)
+├── gui.py               # Interactive matplotlib GUI
+├── demo.py              # Generates the plot at the top of this README
+├── test_suite.py        # Config, utility and algorithm tests
+├── test_tours.py        # Tour construction and solver contract tests
+└── test_interfaces.py   # CLI, config and file IO tests
 ```
 
-### Test Categories
-- **Unit Tests**: Individual function testing
-- **Integration Tests**: End-to-end algorithm testing
-- **Performance Tests**: Benchmarking and scaling tests
-- **Data Validation**: Import/export functionality
+### Adding an algorithm
 
-### Coverage
-- Configuration validation
-- Utility functions
-- All TSP algorithms
-- Data import/export
-- Spatial indexing
-- Error handling
+1. Subclass `TSPAlgorithm` in `algorithms.py`.
+2. Implement `solve_tour(points)` returning an ordering of point indices.
+3. If it fits a curve rather than permuting points, also set
+   `produces_loop = True` and implement `solve_loop(points)`.
+4. Register it in the `ALGORITHMS` dict and add it to
+   `Config.AVAILABLE_ALGORITHMS`.
+5. It is then covered automatically by the contract tests in `test_tours.py`.
 
-## 🤝 Contributing
+## Known limitations
 
-### Development Setup
-```bash
-# Install development dependencies
-pip install -r requirements-dev.txt
+- The genetic algorithm does not beat greedy construction (see above).
+- The association solver's tour quality is sensitive to the vertex count;
+  roughly one vertex per data point works best, and more vertices makes it
+  worse rather than better.
+- `simulated_annealing` is the slowest solver by an order of magnitude because
+  its schedule is a fixed number of temperature steps regardless of problem
+  size.
 
-# Run tests
-python test_suite.py
+## References
 
-# Check code style
-flake8 *.py
+- [Traveling Salesman Problem](https://en.wikipedia.org/wiki/Travelling_salesman_problem)
+- Durbin & Willshaw (1987), *An analogue approach to the travelling salesman
+  problem using an elastic net method* — the origin of the loop-fitting idea
+- [2-opt](https://en.wikipedia.org/wiki/2-opt)
+- [Simulated annealing](https://en.wikipedia.org/wiki/Simulated_annealing)
 
-# Type checking
-mypy *.py
-```
+## License
 
-### Adding New Algorithms
-1. Inherit from `TSPAlgorithm` base class
-2. Implement `solve()` method
-3. Add to algorithm factory in `algorithms.py`
-4. Update configuration and documentation
-5. Add tests in `test_suite.py`
-
-### Code Structure
-```
-├── config.py          # Configuration settings
-├── utils.py           # Utility functions  
-├── algorithms.py      # TSP algorithm implementations
-├── gui.py            # Interactive GUI interface
-├── cli.py            # Command-line interface
-├── main.py           # Main application entry point
-├── test_suite.py     # Comprehensive test suite
-└── README.md         # This file
-```
-
-## 📝 License
-
-This project is open source. Feel free to use, modify, and distribute.
-
-## 🔗 References
-
-- Traveling Salesman Problem: [Wikipedia](https://en.wikipedia.org/wiki/Travelling_salesman_problem)
-- Semi-supervised Learning: [Scholarpedia](http://www.scholarpedia.org/article/Semi-supervised_learning)
-- Genetic Algorithms for TSP: [Tutorial](https://towardsdatascience.com/evolution-of-a-salesman-a-complete-genetic-algorithm-tutorial-for-python-6fe5d2b3ca35)
-- Simulated Annealing: [Optimization Methods](https://optimization.mccormick.northwestern.edu/index.php/Simulated_annealing)
-
-## 📞 Support
-
-For questions, issues, or contributions:
-1. Check existing issues in the repository
-2. Create a new issue with detailed description  
-3. For urgent matters, contact the development team
-
----
-
-**Happy Optimizing! 🎯**
+MIT
