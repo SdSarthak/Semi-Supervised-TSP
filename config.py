@@ -33,8 +33,11 @@ class Config:
     K_CLUSTERS = 40
     INITIAL_MOVE_RATE = 0.25
     INITIAL_SMOOTH_RATE = 0.4
-    MIN_MOVE_RATE = 0.01
-    MIN_SMOOTH_RATE = 0.1
+    # Smoothing has to decay away for the loop to sharpen onto the data. A
+    # floor of 0.1 kept it taut on the convex hull, so interior points were
+    # never threaded and the induced tour lost to plain greedy search.
+    MIN_MOVE_RATE = 0.05
+    MIN_SMOOTH_RATE = 0.0
 
     # Advanced loop parameters for better curves and bends
     ADAPTIVE_VERTEX_DENSITY = True  # Size the loop from the data instead of N_VERTICES

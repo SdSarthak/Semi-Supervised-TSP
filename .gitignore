@@ -110,3 +110,7 @@ serviceAccount*.json
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Generated demo artefacts (the PNG is kept as a README asset)
+demo_solution.json
+exports/

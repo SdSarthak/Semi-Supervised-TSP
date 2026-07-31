@@ -428,7 +428,7 @@ class AssociationTSP(TSPAlgorithm):
     def __init__(self, n_vertices: Optional[int] = None, max_iterations: int = 100,
                  adaptive_vertices: Optional[bool] = None,
                  subdivision_threshold: float = 0.05,
-                 min_move_rate: float = 0.01, min_smooth_rate: float = 0.1,
+                 min_move_rate: float = 0.05, min_smooth_rate: float = 0.0,
                  initial_move_rate: float = 0.3, initial_smooth_rate: float = 0.4,
                  smoothing_iterations: int = 2, reoptimize_every: int = 20,
                  min_vertices: int = 60, max_vertices: int = 300,
