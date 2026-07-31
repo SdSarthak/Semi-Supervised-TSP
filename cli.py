@@ -184,8 +184,8 @@ class TSPCommandLine:
         ax2.set_ylabel('Tour Length')
         
         # Plot elements
-        points_scatter = ax1.scatter(self.points[:, 0], self.points[:, 1], 
-                                   c='red', s=20, alpha=0.7, label='Points')
+        ax1.scatter(self.points[:, 0], self.points[:, 1],
+                    c='red', s=20, alpha=0.7, label='Points')
         tour_line, = ax1.plot([], [], 'b-', linewidth=2, label='Tour')
         vertices_scatter = ax1.scatter([], [], c='blue', s=10, alpha=0.8, label='Vertices')
         

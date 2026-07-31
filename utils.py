@@ -5,7 +5,7 @@ Utility functions for Semi-Supervised TSP Visualizer
 import json
 import os
 import time
-from typing import Tuple, List, Optional, Sequence, Union
+from typing import Tuple, Optional, Sequence, Union
 
 import numpy as np
 from scipy.spatial.distance import cdist

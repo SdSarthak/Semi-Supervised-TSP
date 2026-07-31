@@ -13,7 +13,7 @@ import numpy as np
 
 from backend import has_display, select_backend
 from config import Config
-from utils import (generate_clustered_points, Timer, tour_length,
+from utils import (generate_clustered_points, tour_length,
                    export_data, init_circular_loop, smooth_loop,
                    compute_convergence_metric, adaptive_parameters, SpatialIndex)
 from algorithms import get_algorithm
