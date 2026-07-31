@@ -2,29 +2,77 @@
 Interactive GUI for Semi-Supervised TSP Visualizer
 """
 
+import os
+import time
+from typing import Optional
+
 import numpy as np
+
+from backend import has_display, select_backend
+
+# Binding the backend before pyplot is imported keeps this module importable
+# on a machine with no display: it degrades to the file-writing Agg backend
+# instead of raising at import time.
+select_backend(interactive=True)
+
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from matplotlib.widgets import Slider, Button, RadioButtons, CheckButtons
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from typing import Optional, Callable, Dict, Any
-import threading
-import queue
-import time
+
+try:
+    from tkinter import filedialog, messagebox
+    HAS_TKINTER = True
+except ImportError:  # pragma: no cover - depends on the Python build
+    filedialog = None
+    messagebox = None
+    HAS_TKINTER = False
 
 from config import Config
-from utils import (Timer, generate_clustered_points, tour_length, 
+from main import algorithm_kwargs
+from utils import (generate_clustered_points, tour_length,
                    compute_convergence_metric, adaptive_parameters, export_data)
 from algorithms import get_algorithm
 
+
+def _notify(kind: str, title: str, message: str) -> None:
+    """Show a dialog when tkinter is present, otherwise print.
+
+    tkinter is only used for the file and message dialogs, so a Python build
+    without it should lose the dialogs, not the whole GUI.
+    """
+    if HAS_TKINTER:
+        getattr(messagebox, f'show{kind}')(title, message)
+    else:
+        print(f"[{title}] {message}")
+
+
+def _ask_open_path(title: str):
+    """Prompt for a file to open, or return None when tkinter is unavailable"""
+    if not HAS_TKINTER:
+        print(f"[{title}] tkinter is not available; use cli.py to load files.")
+        return None
+    return filedialog.askopenfilename(
+        title=title,
+        filetypes=[("JSON files", "*.json"), ("All files", "*.*")])
+
+
+def _ask_save_path(title: str, default_extension: str, filetypes):
+    """Prompt for a save destination, or return None when tkinter is unavailable"""
+    if not HAS_TKINTER:
+        print(f"[{title}] tkinter is not available; use cli.py to write files.")
+        return None
+    return filedialog.asksaveasfilename(
+        title=title, defaultextension=default_extension, filetypes=filetypes)
+
 class TSPVisualizer:
     """Main TSP visualization class with interactive controls"""
-    
-    def __init__(self):
+
+    def __init__(self, seed: Optional[int] = None):
         self.config = Config()
         self.config.validate()
-        
+        self.seed = self.config.SEED if seed is None else seed
+        self.solution = None
+
         # Data
         self.points = None
         self.vertices = None
@@ -155,19 +203,23 @@ class TSPVisualizer:
         
     def _generate_initial_data(self):
         """Generate initial random data"""
+        # A fresh stream each time, so the New Data button actually produces
+        # new data instead of redrawing the same seeded point set.
         self.points = generate_clustered_points(
             self.config.N_POINTS,
             self.config.N_CLUSTERS_DATA,
             self.config.CLUSTER_STD,
-            self.config.UNIFORM_RATIO
+            self.config.UNIFORM_RATIO,
+            seed=self.seed,
         )
-        
+        self.seed += 1
+
         # Initialize algorithm
         self._on_algorithm_change('Association')
-        
+
         # Plot initial data
         self._update_plot()
-        
+
     def _on_algorithm_change(self, algorithm_name: str):
         """Handle algorithm selection change"""
         algo_map = {
@@ -178,23 +230,27 @@ class TSPVisualizer:
             'Genetic': 'genetic',
             'Simulated Annealing': 'simulated_annealing'
         }
-        
+
         algo_key = algo_map.get(algorithm_name, 'association')
-        
+
         try:
-            if algo_key in ['association', 'clustering']:
-                kwargs = {'n_vertices': int(self.sliders['n_vertices'].val)}
-                if algo_key == 'clustering':
-                    kwargs = {'n_clusters': int(self.sliders['n_vertices'].val)}
+            slider_value = int(self.sliders['n_vertices'].val)
+            if algo_key == 'association':
+                overrides = {'n_vertices': slider_value, 'adaptive_vertices': False}
+            elif algo_key == 'clustering':
+                overrides = {'n_clusters': slider_value}
             else:
-                kwargs = {}
-                
-            self.algorithm = get_algorithm(algo_key, **kwargs)
+                overrides = {}
+
+            self.algorithm = get_algorithm(
+                algo_key,
+                **algorithm_kwargs(self.config, algo_key, seed=self.seed, **overrides)
+            )
             print(f"Algorithm changed to: {self.algorithm.name}")
-            
+
             # Reset for new algorithm
             self._reset_state()
-            
+
         except Exception as e:
             print(f"Error changing algorithm: {e}")
             
@@ -218,65 +274,74 @@ class TSPVisualizer:
         
     def _on_export(self, event):
         """Handle export button click"""
-        if self.vertices is not None:
-            try:
-                import os
-                os.makedirs(self.config.DEFAULT_EXPORT_DIR, exist_ok=True)
-                
-                timestamp = int(time.time())
-                filename = f"{self.config.DEFAULT_EXPORT_DIR}/tsp_solution_{timestamp}.json"
-                
-                tour_length_val = tour_length(self.vertices)
-                export_data(self.vertices, self.points, filename, tour_length_val)
-                
-                messagebox.showinfo("Export Successful", f"Data exported to {filename}")
-                
-            except Exception as e:
-                messagebox.showerror("Export Error", f"Failed to export: {e}")
-                
+        if self.vertices is None:
+            _notify('warning', "Nothing to Export", "Solve or run the animation first.")
+            return
+
+        try:
+            os.makedirs(self.config.DEFAULT_EXPORT_DIR, exist_ok=True)
+
+            timestamp = int(time.time())
+            filename = os.path.join(self.config.DEFAULT_EXPORT_DIR,
+                                    f"tsp_solution_{timestamp}.json")
+
+            tour = None
+            length = tour_length(self.vertices)
+            if self.algorithm is not None and self.points is not None:
+                # Export the tour over the real points, not just the loop.
+                from utils import order_points_along_loop, tour_length_of_indices
+                if self.algorithm.produces_loop and len(self.points) > 2:
+                    tour = order_points_along_loop(self.points, self.vertices)
+                    length = tour_length_of_indices(self.points, tour)
+
+            export_data(self.vertices, self.points, filename, length,
+                        tour=tour,
+                        algorithm=self.algorithm.name if self.algorithm else None)
+
+            _notify('info', "Export Successful", f"Data exported to {filename}")
+
+        except Exception as e:
+            _notify('error', "Export Error", f"Failed to export: {e}")
+
     def _on_load(self, event):
         """Handle load button click"""
         try:
-            filename = filedialog.askopenfilename(
-                title="Load TSP Data",
-                filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
-            )
-            
+            filename = _ask_open_path("Load TSP Data")
+
             if filename:
                 from utils import load_data
                 vertices, points, tour_length_val = load_data(filename)
-                
+
                 self.vertices = vertices
                 self.points = points
-                
+
                 self._stop_animation()
                 self._reset_state()
                 self._update_plot()
-                
-                messagebox.showinfo("Load Successful", 
-                                  f"Loaded data with tour length: {tour_length_val:.3f}")
-                
+
+                _notify('info', "Load Successful",
+                        f"Loaded data with tour length: {tour_length_val:.3f}")
+
         except Exception as e:
-            messagebox.showerror("Load Error", f"Failed to load: {e}")
-            
+            _notify('error', "Load Error", f"Failed to load: {e}")
+
     def _on_save_video(self, event):
         """Handle save video button click"""
-        if len(self.tour_history) > 10:  # Need some history to make video
-            try:
-                filename = filedialog.asksaveasfilename(
-                    title="Save Animation Video",
-                    defaultextension=".mp4",
-                    filetypes=[("MP4 files", "*.mp4"), ("All files", "*.*")]
-                )
-                
-                if filename:
-                    self._save_animation_video(filename)
-                    messagebox.showinfo("Video Saved", f"Animation saved to {filename}")
-                    
-            except Exception as e:
-                messagebox.showerror("Save Error", f"Failed to save video: {e}")
-        else:
-            messagebox.showwarning("No Data", "Run animation first to generate video data")
+        if len(self.tour_history) <= 10:  # Need some history to make video
+            _notify('warning', "No Data", "Run animation first to generate video data")
+            return
+
+        try:
+            filename = _ask_save_path(
+                "Save Animation Video", ".mp4",
+                [("MP4 files", "*.mp4"), ("GIF files", "*.gif"), ("All files", "*.*")])
+
+            if filename:
+                self._save_animation_video(filename)
+                _notify('info', "Video Saved", f"Animation saved to {filename}")
+
+        except Exception as e:
+            _notify('error', "Save Error", f"Failed to save video: {e}")
             
     def _start_animation(self):
         """Start the animation"""
@@ -330,33 +395,32 @@ class TSPVisualizer:
         self.convergence_values = []
         
         # Initialize vertices based on algorithm
-        if self.algorithm and hasattr(self.algorithm, 'solve'):
-            if self.algorithm.name in ['Association']:
+        if self.algorithm is not None and self.points is not None:
+            if self.algorithm.name == 'Association':
                 from utils import init_circular_loop
                 n_verts = int(self.sliders['n_vertices'].val)
-                self.vertices = init_circular_loop(n_verts)
+                self.vertices = init_circular_loop(n_verts, seed=self.seed)
             else:
                 # For other algorithms, start with a simple solution
                 self.vertices = self.algorithm.solve(self.points)
-                
+
     def _update_frame(self, frame):
         """Update animation frame"""
         if self.is_paused or not self.is_running:
             return
-            
+
         self.current_iteration = frame
-        
+
         try:
-            # Update algorithm
+            # Only the association solver is genuinely iterative. Re-running
+            # a whole genetic or annealing solve every few frames burnt
+            # seconds per frame and made the window unresponsive, so the
+            # non-iterative solvers are computed once and then just displayed.
             if self.algorithm.name == 'Association':
                 self._update_association_algorithm()
-            elif self.algorithm.name == 'K-means Clustering':
-                if frame == 0:  # Only solve once for clustering
-                    self.vertices = self.algorithm.solve(self.points)
-            else:
-                if frame % 10 == 0:  # Update less frequently for heavy algorithms
-                    self.vertices = self.algorithm.solve(self.points)
-                    
+            elif frame == 0 or self.vertices is None:
+                self.vertices = self.algorithm.solve(self.points)
+
             # Record metrics
             if self.vertices is not None:
                 current_length = tour_length(self.vertices)
@@ -407,16 +471,20 @@ class TSPVisualizer:
         if len(self.points) > 0:
             spatial_index = SpatialIndex(self.vertices)
             _, nearest_indices = spatial_index.query_nearest(self.points)
-            
-            # Update vertices toward centroids
+
+            # Accumulate every vertex's catchment in a single pass rather than
+            # rescanning the assignment array once per vertex.
+            sums = np.zeros_like(self.vertices)
+            counts = np.bincount(nearest_indices,
+                                 minlength=len(self.vertices)).astype(float)
+            np.add.at(sums, nearest_indices, self.points)
+
+            assigned = counts > 0
             new_vertices = self.vertices.copy()
-            for v in range(len(self.vertices)):
-                assigned_points = self.points[nearest_indices == v]
-                if len(assigned_points) > 0:
-                    centroid = np.mean(assigned_points, axis=0)
-                    new_vertices[v] = (self.vertices[v] * (1 - move_rate) + 
-                                     centroid * move_rate)
-                                     
+            centroids = sums[assigned] / counts[assigned, None]
+            new_vertices[assigned] = (self.vertices[assigned] * (1 - move_rate)
+                                      + centroids * move_rate)
+
             # Apply smoothing
             self.vertices = smooth_loop(new_vertices, smooth_rate)
             
@@ -518,18 +586,38 @@ class TSPVisualizer:
             
         anim = FuncAnimation(fig_temp, animate_frame, frames=len(self.tour_history),
                            interval=100, blit=False)
-        
-        anim.save(filename, fps=self.config.VIDEO_FPS, dpi=self.config.VIDEO_DPI)
-        plt.close(fig_temp)
-        
+
+        try:
+            anim.save(filename, fps=self.config.VIDEO_FPS, dpi=self.config.VIDEO_DPI)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not write {filename}. Saving MP4 needs ffmpeg on PATH; "
+                f"choose a .gif filename to use the bundled Pillow writer instead. "
+                f"Original error: {exc}"
+            ) from exc
+        finally:
+            plt.close(fig_temp)
+
     def run(self):
         """Run the visualizer"""
+        if not has_display():
+            print("No interactive display is available, so the GUI cannot open.")
+            print("Use 'python cli.py --help' for the batch interface, or set "
+                  "MPLBACKEND to a GUI backend if one is installed.")
+            return 1
         plt.show()
+        return 0
+
 
 def main():
     """Main function to run the interactive TSP visualizer"""
+    if not has_display():
+        print("No interactive display is available, so the GUI cannot open.")
+        print("Use 'python cli.py --help' for the batch interface.")
+        return 1
     visualizer = TSPVisualizer()
-    visualizer.run()
+    return visualizer.run()
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

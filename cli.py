@@ -3,157 +3,175 @@ Command-line interface for Semi-Supervised TSP Visualizer
 """
 
 import argparse
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
 import json
-import time
 import os
+import sys
 
+import numpy as np
+
+from backend import has_display, select_backend
 from config import Config
-from utils import (generate_clustered_points, tour_length, Timer, 
-                   export_data, load_data)
+from main import algorithm_kwargs
+from utils import (generate_clustered_points, tour_length, export_data,
+                   load_points)
 from algorithms import get_algorithm
+
 
 class TSPCommandLine:
     """Command-line interface for TSP visualization"""
-    
-    def __init__(self, config: Config):
+
+    def __init__(self, config: Config, seed: int = None, refine: bool = False):
         self.config = config
+        self.seed = config.SEED if seed is None else seed
+        self.refine = refine
         self.algorithm = None
         self.points = None
         self.vertices = None
+        self.solution = None
         self.tour_history = []
         self.metrics = {'distances': [], 'times': []}
-        
+
     def generate_data(self, n_points: int = None):
         """Generate random test data"""
         n_points = n_points or self.config.N_POINTS
-        
+
         print(f"Generating {n_points} random points...")
         self.points = generate_clustered_points(
             n_points,
             self.config.N_CLUSTERS_DATA,
             self.config.CLUSTER_STD,
-            self.config.UNIFORM_RATIO
+            self.config.UNIFORM_RATIO,
+            seed=self.seed,
         )
         print(f"Generated {len(self.points)} points")
-        
+        return self.points
+
     def load_points_from_file(self, filename: str):
-        """Load points from file"""
+        """Load points from a JSON, CSV or whitespace-delimited file"""
         print(f"Loading points from {filename}...")
-        
-        if filename.endswith('.json'):
-            with open(filename, 'r') as f:
-                data = json.load(f)
-                self.points = np.array(data['points'])
-        elif filename.endswith('.csv'):
-            self.points = np.loadtxt(filename, delimiter=',')
-        else:
-            # Try loading as simple text file
-            self.points = np.loadtxt(filename)
-            
+        self.points = load_points(filename)
         print(f"Loaded {len(self.points)} points")
-        
-    def solve_tsp(self, algorithm_name: str, **kwargs):
-        """Solve TSP using specified algorithm"""
+        return self.points
+
+    def solve_tsp(self, algorithm_name: str, seed: int = None, **overrides):
+        """Solve TSP using the specified algorithm.
+
+        Returns:
+            Length of the tour through every input point.
+        """
         if self.points is None:
             raise ValueError("No points loaded. Generate or load data first.")
-            
+
         print(f"Solving TSP with {algorithm_name} algorithm...")
-        
-        with Timer(f"{algorithm_name} TSP"):
-            self.algorithm = get_algorithm(algorithm_name, **kwargs)
-            self.vertices = self.algorithm.solve(self.points)
-            
-        distance = tour_length(self.vertices)
-        print(f"Tour length: {distance:.6f}")
-        print(f"Number of vertices: {len(self.vertices)}")
-        
-        return distance
-        
+
+        self.algorithm = get_algorithm(
+            algorithm_name,
+            **algorithm_kwargs(self.config, algorithm_name,
+                               seed=self.seed if seed is None else seed,
+                               **overrides)
+        )
+        self.solution = self.algorithm.evaluate(self.points, refine=self.refine)
+        self.vertices = self.solution.loop
+
+        print(f"{algorithm_name} TSP took {self.solution.runtime:.3f} seconds")
+        print(f"Tour length: {self.solution.length:.6f}")
+        if self.algorithm.produces_loop:
+            print(f"Fitted loop length: {self.solution.loop_length:.6f} "
+                  f"({len(self.solution.loop)} vertices)")
+
+        return self.solution.length
+
     def compare_algorithms(self, algorithms: list, runs: int = 1):
-        """Compare multiple algorithms"""
+        """Compare multiple algorithms on the same points"""
         if self.points is None:
             raise ValueError("No points loaded. Generate or load data first.")
-            
+
         results = {}
-        
-        print(f"\nComparing {len(algorithms)} algorithms with {runs} runs each...")
+
+        print(f"\nComparing {len(algorithms)} algorithms with {runs} run(s) each...")
         print("-" * 80)
-        
+
         for algo_name in algorithms:
             print(f"\nTesting {algo_name}...")
             distances = []
             times = []
-            
+
             for run in range(runs):
-                start_time = time.time()
-                
                 try:
-                    distance = self.solve_tsp(algo_name)
-                    elapsed = time.time() - start_time
-                    
+                    # A fresh stream per run, otherwise repeat runs of a
+                    # stochastic solver all report the same number.
+                    distance = self.solve_tsp(algo_name, seed=self.seed + run)
                     distances.append(distance)
-                    times.append(elapsed)
-                    
+                    times.append(self.solution.runtime)
+
                     if runs > 1:
-                        print(f"  Run {run+1}: {distance:.6f} ({elapsed:.3f}s)")
-                        
+                        print(f"  Run {run+1}: {distance:.6f} ({self.solution.runtime:.3f}s)")
+
                 except Exception as e:
                     print(f"  Run {run+1}: FAILED - {e}")
                     continue
-                    
+
             if distances:
-                avg_distance = np.mean(distances)
-                std_distance = np.std(distances)
-                avg_time = np.mean(times)
-                
                 results[algo_name] = {
-                    'avg_distance': avg_distance,
-                    'std_distance': std_distance,
-                    'avg_time': avg_time,
-                    'distances': distances,
-                    'times': times
+                    'avg_distance': float(np.mean(distances)),
+                    'std_distance': float(np.std(distances)),
+                    'best_distance': float(np.min(distances)),
+                    'avg_time': float(np.mean(times)),
+                    'distances': [float(d) for d in distances],
+                    'times': [float(t) for t in times],
                 }
-                
-                print(f"  Average: {avg_distance:.6f} ± {std_distance:.6f}")
-                print(f"  Time: {avg_time:.3f}s")
-                
-        # Print summary
-        print("\n" + "="*80)
-        print("COMPARISON SUMMARY")
-        print("="*80)
-        
+
+                print(f"  Average: {results[algo_name]['avg_distance']:.6f} "
+                      f"+/- {results[algo_name]['std_distance']:.6f}")
+                print(f"  Time: {results[algo_name]['avg_time']:.3f}s")
+
+        print("\n" + "=" * 80)
+        print("COMPARISON SUMMARY (tour length over all input points)")
+        print("=" * 80)
+
         sorted_results = sorted(results.items(), key=lambda x: x[1]['avg_distance'])
-        
+
         for i, (algo_name, result) in enumerate(sorted_results):
             print(f"{i+1:2d}. {algo_name:20s} | "
-                  f"Distance: {result['avg_distance']:8.6f} ± {result['std_distance']:8.6f} | "
+                  f"Distance: {result['avg_distance']:8.6f} "
+                  f"+/- {result['std_distance']:8.6f} | "
+                  f"Best: {result['best_distance']:8.6f} | "
                   f"Time: {result['avg_time']:6.3f}s")
-                  
+
+        if not results:
+            print("No algorithm completed successfully.")
+
         return results
-        
-    def animate_solution(self, algorithm_name: str, save_video: str = None, **kwargs):
+
+
+    def animate_solution(self, algorithm_name: str, save_video: str = None, **overrides):
         """Create animated visualization of algorithm"""
         if self.points is None:
             raise ValueError("No points loaded. Generate or load data first.")
-            
+
         print(f"Creating animation for {algorithm_name}...")
-        
-        # Setup algorithm
-        self.algorithm = get_algorithm(algorithm_name, **kwargs)
-        
+
+        # Writing a file never needs a window; a live animation does.
+        select_backend(interactive=save_video is None)
+        import matplotlib.pyplot as plt
+        from matplotlib.animation import FuncAnimation
+
+        self.algorithm = get_algorithm(
+            algorithm_name,
+            **algorithm_kwargs(self.config, algorithm_name, seed=self.seed, **overrides)
+        )
+
         # Initialize
         if algorithm_name == 'association':
             from utils import init_circular_loop
-            self.vertices = init_circular_loop(kwargs.get('n_vertices', 50))
+            self.vertices = init_circular_loop(
+                overrides.get('n_vertices', self.config.N_VERTICES), seed=self.seed)
         else:
             self.vertices = self.algorithm.solve(self.points)
-            
+
         # Setup plot
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-        
+
         # Main plot
         ax1.set_xlim(0, 1)
         ax1.set_ylim(0, 1)
@@ -212,92 +230,134 @@ class TSPCommandLine:
         
         if save_video:
             print(f"Saving animation to {save_video}...")
-            anim.save(save_video, fps=30, dpi=150)
+            os.makedirs(os.path.dirname(os.path.abspath(save_video)), exist_ok=True)
+            try:
+                anim.save(save_video, fps=self.config.VIDEO_FPS,
+                          dpi=self.config.VIDEO_DPI)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not write {save_video}. Saving MP4 needs ffmpeg on PATH; "
+                    f"use a .gif extension to fall back to the bundled Pillow writer. "
+                    f"Original error: {exc}"
+                ) from exc
             print(f"Animation saved to {save_video}")
-        else:
+        elif has_display():
             plt.show()
-            
+        else:
+            print("No interactive display available; "
+                  "pass --output to write the animation to a file instead.")
+
         return anim
-        
+
     def _update_association_step(self, iteration):
         """Update association algorithm step"""
         from utils import SpatialIndex, smooth_loop, adaptive_parameters
-        
+
         # Get adaptive parameters
         move_rate, smooth_rate = adaptive_parameters(
             iteration, self.config.STEPS,
             self.config.INITIAL_MOVE_RATE,
-            self.config.INITIAL_SMOOTH_RATE
+            self.config.INITIAL_SMOOTH_RATE,
+            self.config.MIN_MOVE_RATE,
+            self.config.MIN_SMOOTH_RATE,
         )
-        
+
         # Assign points to vertices
         if len(self.points) > 0:
             spatial_index = SpatialIndex(self.vertices)
             _, nearest_indices = spatial_index.query_nearest(self.points)
-            
-            # Update vertices
+
+            # Accumulate every vertex's catchment in a single pass.
+            sums = np.zeros_like(self.vertices)
+            counts = np.bincount(nearest_indices,
+                                 minlength=len(self.vertices)).astype(float)
+            np.add.at(sums, nearest_indices, self.points)
+
+            assigned = counts > 0
             new_vertices = self.vertices.copy()
-            for v in range(len(self.vertices)):
-                assigned_points = self.points[nearest_indices == v]
-                if len(assigned_points) > 0:
-                    centroid = np.mean(assigned_points, axis=0)
-                    new_vertices[v] = (self.vertices[v] * (1 - move_rate) + 
-                                     centroid * move_rate)
-                                     
+            centroids = sums[assigned] / counts[assigned, None]
+            new_vertices[assigned] = (self.vertices[assigned] * (1 - move_rate)
+                                      + centroids * move_rate)
+
             # Smooth
             self.vertices = smooth_loop(new_vertices, smooth_rate)
-            
+
     def export_solution(self, filename: str):
         """Export current solution"""
-        if self.vertices is None:
-            raise ValueError("No solution to export")
-            
-        distance = tour_length(self.vertices)
-        export_data(self.vertices, self.points, filename, distance)
-        print(f"Solution exported to {filename}")
-        
-    def benchmark_performance(self, n_points_list: list, algorithms: list):
-        """Benchmark algorithms with different problem sizes"""
+        if self.solution is None:
+            raise ValueError("No solution to export. Solve first.")
+
+        export_data(self.solution.loop, self.points, filename,
+                    self.solution.length, tour=self.solution.tour,
+                    algorithm=self.solution.algorithm)
+        return filename
+
+    def benchmark_performance(self, n_points_list: list, algorithms: list,
+                              output: str = None):
+        """Benchmark algorithms across a range of problem sizes"""
         results = {}
-        
+
         print(f"\nBenchmarking {len(algorithms)} algorithms with problem sizes: {n_points_list}")
-        print("="*100)
-        
+        print("=" * 100)
+
         for n_points in n_points_list:
             print(f"\nProblem size: {n_points} points")
             print("-" * 50)
-            
+
             # Generate data for this size
             self.generate_data(n_points)
-            
+
             size_results = {}
-            
+
             for algo_name in algorithms:
                 try:
-                    start_time = time.time()
                     distance = self.solve_tsp(algo_name)
-                    elapsed = time.time() - start_time
-                    
                     size_results[algo_name] = {
-                        'distance': distance,
-                        'time': elapsed
+                        'distance': float(distance),
+                        'time': float(self.solution.runtime),
                     }
-                    
-                    print(f"  {algo_name:20s}: {distance:8.6f} ({elapsed:6.3f}s)")
-                    
+                    print(f"  {algo_name:20s}: {distance:8.6f} "
+                          f"({self.solution.runtime:6.3f}s)")
+
                 except Exception as e:
                     print(f"  {algo_name:20s}: FAILED - {e}")
-                    
+
             results[n_points] = size_results
-            
+
+        if output:
+            os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
+            with open(output, 'w', encoding='utf-8') as f:
+                json.dump({str(k): v for k, v in results.items()}, f, indent=2)
+            print(f"\nBenchmark results written to {output}")
+
         return results
+
+def solver_overrides(algorithm: str, vertices: int = None):
+    """Translate the shared --vertices flag into per-solver parameters.
+
+    The flag means different things to different solvers, and passing
+    ``n_vertices`` to the clustering solver used to raise a TypeError.
+    """
+    if not vertices:
+        return {}
+    if algorithm == 'association':
+        return {'n_vertices': vertices, 'adaptive_vertices': False}
+    if algorithm == 'clustering':
+        return {'n_clusters': vertices}
+    return {}
+
 
 def create_parser():
     """Create command-line argument parser"""
     parser = argparse.ArgumentParser(description='Semi-Supervised TSP Visualizer')
-    
+
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Random seed (default: Config.SEED)')
+    parser.add_argument('--refine', action='store_true',
+                        help='Polish every tour with 2-opt before reporting')
+
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
-    
+
     # Generate data command
     gen_parser = subparsers.add_parser('generate', help='Generate random test data')
     gen_parser.add_argument('--points', '-p', type=int, default=100,
@@ -315,8 +375,8 @@ def create_parser():
                              help='Generate random points instead')
     solve_parser.add_argument('--output', '-o', type=str,
                              help='Output file for solution')
-    solve_parser.add_argument('--vertices', '-v', type=int, default=50,
-                             help='Number of vertices (for association/clustering)')
+    solve_parser.add_argument('--vertices', '-v', type=int, default=None,
+                             help='Loop vertices (association) or clusters (clustering)')
     
     # Compare command
     compare_parser = subparsers.add_parser('compare', help='Compare algorithms')
@@ -340,9 +400,9 @@ def create_parser():
                                help='Generate random points instead')
     animate_parser.add_argument('--output', '-o', type=str,
                                help='Output video file')
-    animate_parser.add_argument('--vertices', '-v', type=int, default=50,
-                               help='Number of vertices')
-    
+    animate_parser.add_argument('--vertices', '-v', type=int, default=None,
+                               help='Loop vertices (association) or clusters (clustering)')
+
     # Benchmark command
     benchmark_parser = subparsers.add_parser('benchmark', help='Benchmark performance')
     benchmark_parser.add_argument('algorithms', nargs='+',
@@ -351,87 +411,90 @@ def create_parser():
     benchmark_parser.add_argument('--sizes', '-s', nargs='+', type=int,
                                  default=[50, 100, 200, 300],
                                  help='Problem sizes to test')
-    
+    benchmark_parser.add_argument('--output', '-o', type=str,
+                                 help='Write benchmark results to a JSON file')
+
     # GUI command
-    gui_parser = subparsers.add_parser('gui', help='Launch interactive GUI')
-    
+    subparsers.add_parser('gui', help='Launch interactive GUI')
+
     return parser
 
-def main():
-    """Main command-line interface"""
+
+def main(argv=None):
+    """Main command-line interface.
+
+    Args:
+        argv: argument list to parse; defaults to ``sys.argv[1:]``. Accepting
+            it explicitly lets ``main.py --mode cli`` forward its own
+            leftover arguments instead of re-reading sys.argv, which used to
+            make the two parsers fight over the same tokens.
+    """
     parser = create_parser()
-    args = parser.parse_args()
-    
+    args = parser.parse_args(argv)
+
     if not args.command:
         parser.print_help()
-        return
-        
+        return 0
+
     config = Config()
-    tsp = TSPCommandLine(config)
-    
+    config.validate()
+    tsp = TSPCommandLine(config, seed=args.seed, refine=args.refine)
+
     try:
         if args.command == 'generate':
             tsp.generate_data(args.points)
             if args.output:
-                data = {'points': tsp.points.tolist()}
-                with open(args.output, 'w') as f:
-                    json.dump(data, f, indent=2)
+                os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+                with open(args.output, 'w', encoding='utf-8') as f:
+                    json.dump({'points': tsp.points.tolist()}, f, indent=2)
                 print(f"Points saved to {args.output}")
-                
+
         elif args.command == 'solve':
-            # Load or generate data
             if args.input:
                 tsp.load_points_from_file(args.input)
             else:
                 tsp.generate_data(args.points or 100)
-                
-            # Solve
-            kwargs = {}
-            if args.algorithm in ['association', 'clustering']:
-                kwargs['n_vertices'] = args.vertices
-                
-            tsp.solve_tsp(args.algorithm, **kwargs)
-            
-            # Export if requested
+
+            tsp.solve_tsp(args.algorithm,
+                          **solver_overrides(args.algorithm, args.vertices))
+
             if args.output:
                 tsp.export_solution(args.output)
-                
+
         elif args.command == 'compare':
-            # Load or generate data
             if args.input:
                 tsp.load_points_from_file(args.input)
             else:
                 tsp.generate_data(args.points or 100)
-                
-            # Compare
+
             tsp.compare_algorithms(args.algorithms, args.runs)
-            
+
         elif args.command == 'animate':
-            # Load or generate data
             if args.input:
                 tsp.load_points_from_file(args.input)
             else:
                 tsp.generate_data(args.points or 100)
-                
-            # Animate
-            kwargs = {}
-            if args.algorithm in ['association', 'clustering']:
-                kwargs['n_vertices'] = args.vertices
-                
-            tsp.animate_solution(args.algorithm, args.output, **kwargs)
-            
+
+            tsp.animate_solution(args.algorithm, args.output,
+                                 **solver_overrides(args.algorithm, args.vertices))
+
         elif args.command == 'benchmark':
-            tsp.benchmark_performance(args.sizes, args.algorithms)
-            
+            tsp.benchmark_performance(args.sizes, args.algorithms,
+                                      output=args.output)
+
         elif args.command == 'gui':
             from gui import main as gui_main
-            gui_main()
-            
+            return gui_main() or 0
+
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
+        return 130
     except Exception as e:
         print(f"Error: {e}")
         return 1
-        
+
     return 0
 
+
 if __name__ == "__main__":
-    exit(main())
+    sys.exit(main())

@@ -6,154 +6,221 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-import numpy as np
-import matplotlib
-matplotlib.use('TkAgg')  # Use TkAgg backend for better GUI support
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
 import argparse
 import time
 
+import numpy as np
+
+from backend import has_display, select_backend
 from config import Config
 from utils import (generate_clustered_points, Timer, tour_length,
                    export_data, init_circular_loop, smooth_loop,
                    compute_convergence_metric, adaptive_parameters, SpatialIndex)
 from algorithms import get_algorithm
 
+
+def algorithm_kwargs(config, algorithm_name, seed=None, **overrides):
+    """Build solver keyword arguments from a config object.
+
+    Keeping this in one place stops the CLI, the GUI and the simple mode from
+    drifting apart on what a given algorithm is configured with.
+    """
+    kwargs = {'seed': seed}
+
+    if algorithm_name == 'association':
+        kwargs.update(
+            n_vertices=config.N_VERTICES,
+            max_iterations=config.STEPS,
+            adaptive_vertices=getattr(config, 'ADAPTIVE_VERTEX_DENSITY', True),
+            subdivision_threshold=getattr(config, 'SUBDIVISION_THRESHOLD', 0.05),
+            smoothing_iterations=getattr(config, 'SMOOTHING_ITERATIONS', 2),
+            initial_move_rate=config.INITIAL_MOVE_RATE,
+            initial_smooth_rate=config.INITIAL_SMOOTH_RATE,
+            min_move_rate=config.MIN_MOVE_RATE,
+            min_smooth_rate=config.MIN_SMOOTH_RATE,
+            min_vertices=config.MIN_VERTICES,
+            max_vertices=config.MAX_VERTICES,
+            vertex_density_factor=config.VERTEX_DENSITY_FACTOR,
+        )
+    elif algorithm_name == 'clustering':
+        kwargs.update(
+            n_clusters=config.K_CLUSTERS,
+            n_interpolated_vertices=config.N_VERTICES,
+        )
+    elif algorithm_name == 'genetic':
+        kwargs.update(
+            population_size=config.GA_POPULATION_SIZE,
+            generations=config.GA_GENERATIONS,
+            mutation_rate=config.GA_MUTATION_RATE,
+            elite_size=config.GA_ELITE_SIZE,
+            tournament_size=config.GA_TOURNAMENT_SIZE,
+        )
+    elif algorithm_name == 'simulated_annealing':
+        kwargs.update(
+            initial_temp=config.SA_INITIAL_TEMP,
+            cooling_rate=config.SA_COOLING_RATE,
+            min_temp=config.SA_MIN_TEMP,
+            iterations_per_temp=config.SA_ITERATIONS_PER_TEMP,
+        )
+
+    kwargs.update(overrides)
+    return kwargs
+
+
 class EnhancedTSPVisualizer:
     """Enhanced TSP visualizer with multiple modes and algorithms"""
-    
-    def __init__(self, mode='gui'):
+
+    def __init__(self, mode='gui', seed=None):
         self.config = Config()
         self.config.validate()
-        
+
         self.mode = mode
+        self.seed = self.config.SEED if seed is None else seed
         self.points = None
         self.vertices = None
         self.algorithm = None
+        self.solution = None
         self.tour_history = []
         self.metrics_history = {'distances': [], 'convergence': [], 'times': []}
-        
+
         # Animation state
         self.current_iteration = 0
         self.previous_vertices = None
         self.start_time = None
-        
-        np.random.seed(self.config.SEED)
-        
+
     def generate_data(self, n_points=None):
         """Generate test data"""
         n_points = n_points or self.config.N_POINTS
-        
+
         print(f"Generating {n_points} test points...")
         self.points = generate_clustered_points(
             n_points,
             self.config.N_CLUSTERS_DATA,
             self.config.CLUSTER_STD,
-            self.config.UNIFORM_RATIO
+            self.config.UNIFORM_RATIO,
+            seed=self.seed,
         )
         print(f"Generated {len(self.points)} points")
-        
+        return self.points
+
     def set_algorithm(self, algorithm_name, **kwargs):
         """Set the TSP algorithm"""
         print(f"Setting algorithm: {algorithm_name}")
-        
-        # Set default parameters based on algorithm with enhanced vertex counts
-        if algorithm_name == 'association':
-            kwargs.setdefault('n_vertices', self.config.N_VERTICES)
-            kwargs.setdefault('max_iterations', self.config.STEPS)
-            kwargs.setdefault('adaptive_vertices', getattr(self.config, 'ADAPTIVE_VERTEX_DENSITY', True))
-            kwargs.setdefault('subdivision_threshold', getattr(self.config, 'SUBDIVISION_THRESHOLD', 0.05))
-        elif algorithm_name == 'clustering':
-            kwargs.setdefault('n_clusters', self.config.K_CLUSTERS)
-            kwargs.setdefault('n_interpolated_vertices', self.config.N_VERTICES)
-        elif algorithm_name == 'genetic':
-            kwargs.setdefault('population_size', self.config.GA_POPULATION_SIZE)
-            kwargs.setdefault('generations', self.config.GA_GENERATIONS)
-        elif algorithm_name == 'simulated_annealing':
-            kwargs.setdefault('initial_temp', self.config.SA_INITIAL_TEMP)
-            kwargs.setdefault('cooling_rate', self.config.SA_COOLING_RATE)
-            
-        self.algorithm = get_algorithm(algorithm_name, **kwargs)
+
+        seed = kwargs.pop('seed', self.seed)
+        self.algorithm = get_algorithm(
+            algorithm_name,
+            **algorithm_kwargs(self.config, algorithm_name, seed=seed, **kwargs)
+        )
         print(f"Algorithm set: {self.algorithm.name}")
-        if hasattr(self.algorithm, 'n_vertices'):
-            print(f"Using {self.algorithm.n_vertices} vertices for finer resolution")
-        
-    def solve_static(self):
-        """Solve TSP with static algorithm (non-iterative)"""
+        return self.algorithm
+
+    def solve_static(self, refine=False):
+        """Solve the TSP and report the tour length over the data points.
+
+        Returns:
+            The length of the tour through every input point. For the
+            loop-based solvers this is the tour induced by the fitted loop,
+            not the (always shorter) length of the loop itself.
+        """
         if self.algorithm is None or self.points is None or len(self.points) == 0:
             raise ValueError("Algorithm and points must be set")
-            
+
         print(f"Solving TSP with {self.algorithm.name}...")
-        
-        with Timer(f"{self.algorithm.name} solve"):
-            self.vertices = self.algorithm.solve(self.points.copy())
-            
-        distance = tour_length(self.vertices)
-        print(f"Solution found - Tour length: {distance:.6f}")
-        print(f"Number of vertices: {len(self.vertices)}")
-        
-        return distance
-        
+
+        self.solution = self.algorithm.evaluate(self.points, refine=refine)
+        self.vertices = self.solution.loop
+
+        print(f"Solve took {self.solution.runtime:.3f} seconds")
+        print(f"Solution found - Tour length: {self.solution.length:.6f}")
+        if self.algorithm.produces_loop:
+            print(f"Fitted loop length: {self.solution.loop_length:.6f} "
+                  f"({len(self.solution.loop)} vertices)")
+
+        return self.solution.length
+
+
     def run_animation(self, save_video=None, show_plot=True):
-        """Run animated visualization"""
+        """Run animated visualization.
+
+        Args:
+            save_video: path to write an MP4 to instead of opening a window.
+            show_plot: False runs the iterations headless, printing progress.
+        """
         if self.algorithm is None or self.points is None or len(self.points) == 0:
             raise ValueError("Algorithm and points must be set")
-            
+
         print(f"Starting animation with {self.algorithm.name}...")
-        
+
         # Initialize vertices for iterative algorithms
-        if self.algorithm.name in ['Association']:
+        if self.algorithm.name == 'Association':
             self.vertices = init_circular_loop(
-                getattr(self.algorithm, 'n_vertices', self.config.N_VERTICES)
+                self.config.N_VERTICES, seed=self.seed
             )
         else:
             # For non-iterative algorithms, solve once and animate the result
-            self.vertices = self.algorithm.solve(self.points.copy())
-            
+            self.vertices = self.algorithm.solve(self.points)
+
         # Reset state
         self.current_iteration = 0
         self.tour_history = []
         self.metrics_history = {'distances': [], 'convergence': [], 'times': []}
         self.previous_vertices = None
         self.start_time = time.time()
-        
-        # Setup visualization
-        if show_plot:
-            fig, axes = self._setup_visualization()
-            
-            # Create animation
-            anim = FuncAnimation(
-                fig, self._update_frame,
-                frames=self.config.STEPS,
-                interval=self.config.INTERVAL_MS,
-                blit=False,
-                repeat=False
-            )
-            
-            # Save or show
-            if save_video:
-                print(f"Saving animation to {save_video}...")
-                anim.save(save_video, fps=self.config.VIDEO_FPS, 
-                         dpi=self.config.VIDEO_DPI)
-                print(f"Animation saved!")
-            else:
-                plt.tight_layout()
-                plt.show()
-                
-            return anim
-        else:
-            # Run without visualization
+
+        if not show_plot and not save_video:
+            # Run the iterations without drawing anything.
             for frame in range(self.config.STEPS):
                 self._update_frame(frame)
                 if frame % 50 == 0:
                     distance = tour_length(self.vertices) if self.vertices is not None else 0
-                    print(f"Frame {frame}: Tour length = {distance:.6f}")
-                    
+                    print(f"Frame {frame}: Loop length = {distance:.6f}")
+            return None
+
+        # Writing a video never needs a window; a live animation does.
+        select_backend(interactive=save_video is None)
+        import matplotlib.pyplot as plt
+        from matplotlib.animation import FuncAnimation
+
+        fig, axes = self._setup_visualization()
+
+        anim = FuncAnimation(
+            fig, self._update_frame,
+            frames=self.config.STEPS,
+            interval=self.config.INTERVAL_MS,
+            blit=False,
+            repeat=False
+        )
+
+        if save_video:
+            print(f"Saving animation to {save_video}...")
+            parent = os.path.dirname(os.path.abspath(save_video))
+            os.makedirs(parent, exist_ok=True)
+            try:
+                anim.save(save_video, fps=self.config.VIDEO_FPS,
+                          dpi=self.config.VIDEO_DPI)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not write {save_video}. Saving MP4 needs ffmpeg on PATH; "
+                    f"use a .gif extension to fall back to the bundled Pillow writer. "
+                    f"Original error: {exc}"
+                ) from exc
+            print("Animation saved!")
+        elif has_display():
+            plt.tight_layout()
+            plt.show()
+        else:
+            print("No interactive display available; "
+                  "pass --save-video to write the animation to a file instead.")
+
+        return anim
+
     def _setup_visualization(self):
         """Setup the visualization plots"""
+        import matplotlib.pyplot as plt
+
         fig = plt.figure(figsize=(15, 6))
-        
+
         # Main TSP plot
         ax1 = plt.subplot(1, 3, 1)
         ax1.set_xlim(0, 1)
@@ -251,6 +318,9 @@ class EnhancedTSPVisualizer:
             
     def _update_plots(self):
         """Update all visualization plots"""
+        if not getattr(self, 'axes', None):
+            return
+
         # Clear all axes
         for ax in self.axes:
             ax.clear()
@@ -310,160 +380,233 @@ class EnhancedTSPVisualizer:
         """Export current results"""
         if filename is None:
             timestamp = int(time.time())
-            filename = f"tsp_result_{timestamp}.json"
-            
-        if self.vertices is not None:
-            distance = tour_length(self.vertices)
-            export_data(self.vertices, self.points, filename, distance)
-            print(f"Results exported to {filename}")
-        else:
+            filename = os.path.join(self.config.DEFAULT_EXPORT_DIR,
+                                    f"tsp_result_{timestamp}.json")
+
+        if self.solution is None:
             print("No results to export")
-            
-    def compare_algorithms(self, algorithms, runs=1):
-        """Compare multiple algorithms"""
+            return None
+
+        export_data(self.solution.loop, self.points, filename,
+                    self.solution.length, tour=self.solution.tour,
+                    algorithm=self.solution.algorithm)
+        return filename
+
+    def compare_algorithms(self, algorithms, runs=1, refine=False):
+        """Compare multiple algorithms on the same set of points.
+
+        Every algorithm is scored on the length of the tour it produces over
+        the input points, so loop-based and permutation solvers are measured
+        on the same quantity. Spread across runs reflects each solver's own
+        randomness; the point set is held fixed.
+        """
         if self.points is None or len(self.points) == 0:
             raise ValueError("Points must be generated first")
-            
+
         results = {}
-        print(f"\nComparing {len(algorithms)} algorithms...")
-        print("=" * 60)
-        
+        print(f"\nComparing {len(algorithms)} algorithms on {len(self.points)} points...")
+        print("=" * 72)
+
         for algo_name in algorithms:
             print(f"\nTesting {algo_name}...")
             distances = []
             times = []
-            
+
             for run in range(runs):
                 try:
-                    self.set_algorithm(algo_name)
-                    
-                    start_time = time.time()
-                    distance = self.solve_static()
-                    elapsed = time.time() - start_time
-                    
+                    # Vary the stream per run so repeated runs of a stochastic
+                    # solver actually explore, instead of reporting zero spread.
+                    self.set_algorithm(algo_name, seed=self.seed + run)
+                    distance = self.solve_static(refine=refine)
+
                     distances.append(distance)
-                    times.append(elapsed)
-                    
+                    times.append(self.solution.runtime)
+
                     if runs > 1:
-                        print(f"  Run {run+1}: {distance:.6f} ({elapsed:.3f}s)")
-                        
+                        print(f"  Run {run+1}: {distance:.6f} ({self.solution.runtime:.3f}s)")
+
                 except Exception as e:
                     print(f"  Run {run+1}: FAILED - {e}")
-                    
+
             if distances:
-                avg_distance = np.mean(distances)
-                std_distance = np.std(distances)
-                avg_time = np.mean(times)
-                
                 results[algo_name] = {
-                    'avg_distance': avg_distance,
-                    'std_distance': std_distance,
-                    'avg_time': avg_time
+                    'avg_distance': float(np.mean(distances)),
+                    'std_distance': float(np.std(distances)),
+                    'best_distance': float(np.min(distances)),
+                    'avg_time': float(np.mean(times)),
+                    'runs': len(distances),
                 }
-                
-                print(f"  Average: {avg_distance:.6f} ± {std_distance:.6f} ({avg_time:.3f}s)")
-                
-        # Print comparison summary
-        print("\n" + "=" * 60)
-        print("COMPARISON SUMMARY")
-        print("=" * 60)
-        
+
+                print(f"  Average: {results[algo_name]['avg_distance']:.6f} "
+                      f"± {results[algo_name]['std_distance']:.6f} "
+                      f"({results[algo_name]['avg_time']:.3f}s)")
+
+        print("\n" + "=" * 72)
+        print("COMPARISON SUMMARY (tour length over all input points)")
+        print("=" * 72)
+
         sorted_results = sorted(results.items(), key=lambda x: x[1]['avg_distance'])
         for i, (algo_name, result) in enumerate(sorted_results):
             print(f"{i+1:2d}. {algo_name:20s} | "
                   f"Distance: {result['avg_distance']:8.6f} ± {result['std_distance']:8.6f} | "
+                  f"Best: {result['best_distance']:8.6f} | "
                   f"Time: {result['avg_time']:6.3f}s")
-                  
+
+        if not results:
+            print("No algorithm completed successfully.")
+
         return results
 
-def main():
-    """Main entry point"""
-    parser = argparse.ArgumentParser(description='Enhanced Semi-Supervised TSP Visualizer')
-    
+def plot_solution(visualizer, save_plot=None, show=True):
+    """Draw the points and the solved tour, optionally saving to a file"""
+    select_backend(interactive=save_plot is None and show)
+    import matplotlib.pyplot as plt
+
+    solution = visualizer.solution
+    fig = plt.figure(figsize=(10, 8))
+
+    plt.scatter(visualizer.points[:, 0], visualizer.points[:, 1],
+                c='red', s=20, alpha=0.7, label=f'Points ({len(visualizer.points)})')
+
+    if solution is not None:
+        ordered = solution.tour_points
+        tour_x = np.append(ordered[:, 0], ordered[0, 0])
+        tour_y = np.append(ordered[:, 1], ordered[0, 1])
+        plt.plot(tour_x, tour_y, 'b-', linewidth=2,
+                 label=f'Tour (length: {solution.length:.6f})')
+
+        if visualizer.algorithm.produces_loop:
+            loop = solution.loop
+            loop_x = np.append(loop[:, 0], loop[0, 0])
+            loop_y = np.append(loop[:, 1], loop[0, 1])
+            plt.plot(loop_x, loop_y, 'g--', linewidth=1, alpha=0.6,
+                     label=f'Fitted loop ({solution.loop_length:.6f})')
+
+    plt.title(f'TSP Solution - {visualizer.algorithm.name}')
+    plt.legend()
+    plt.axis('equal')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    if save_plot:
+        os.makedirs(os.path.dirname(os.path.abspath(save_plot)), exist_ok=True)
+        plt.savefig(save_plot, dpi=150, bbox_inches='tight')
+        print(f"Plot saved to {save_plot}")
+        plt.close(fig)
+    elif show and has_display():
+        plt.show()
+    else:
+        print("No interactive display available; use --save-plot to write a PNG.")
+        plt.close(fig)
+
+
+def build_parser():
+    """Create the argument parser for the simple/GUI entry point"""
+    parser = argparse.ArgumentParser(
+        description='Semi-Supervised TSP Visualizer',
+        epilog='For batch work and benchmarking use cli.py (or --mode cli).')
+
     parser.add_argument('--mode', choices=['gui', 'cli', 'simple'], default='simple',
-                       help='Run mode (default: simple)')
+                        help='Run mode (default: simple)')
     parser.add_argument('--algorithm', '-a', choices=Config.AVAILABLE_ALGORITHMS,
-                       default='association', help='Algorithm to use')
+                        default='association', help='Algorithm to use')
     parser.add_argument('--points', '-p', type=int, default=200,
-                       help='Number of points')
+                        help='Number of points')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Random seed (default: Config.SEED)')
+    parser.add_argument('--refine', action='store_true',
+                        help='Polish the resulting tour with 2-opt')
     parser.add_argument('--animate', action='store_true',
-                       help='Show animation')
+                        help='Show animation')
     parser.add_argument('--compare', nargs='+', choices=Config.AVAILABLE_ALGORITHMS,
-                       help='Compare multiple algorithms')
+                        help='Compare multiple algorithms')
+    parser.add_argument('--runs', '-r', type=int, default=1,
+                        help='Runs per algorithm when comparing')
     parser.add_argument('--save-video', type=str,
-                       help='Save animation as video')
+                        help='Save animation as video')
+    parser.add_argument('--save-plot', type=str,
+                        help='Save the static solution plot to an image file')
     parser.add_argument('--export', type=str,
-                       help='Export results to file')
+                        help='Export results to a JSON file')
     parser.add_argument('--no-plot', action='store_true',
-                       help='Run without showing plots')
-    
-    args = parser.parse_args()
-    
+                        help='Run without showing plots')
+
+    return parser
+
+
+def split_cli_delegation(argv):
+    """Detect `--mode cli` and return the arguments meant for cli.py.
+
+    Both parsers define flags such as ``--points``, so letting this parser run
+    first would swallow arguments intended for the CLI subcommand. Delegation
+    is therefore decided by inspecting the raw argument list.
+
+    Returns:
+        The remaining arguments when CLI mode was requested, otherwise None.
+    """
+    argv = list(argv)
+
+    for index, token in enumerate(argv):
+        if token == '--mode' and index + 1 < len(argv) and argv[index + 1] == 'cli':
+            return argv[:index] + argv[index + 2:]
+        if token == '--mode=cli':
+            return argv[:index] + argv[index + 1:]
+
+    return None
+
+
+def main(argv=None):
+    """Main entry point"""
+    if argv is None:
+        argv = sys.argv[1:]
+
+    delegated = split_cli_delegation(argv)
+    if delegated is not None:
+        from cli import main as cli_main
+        return cli_main(delegated)
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
     try:
         if args.mode == 'gui':
-            # Launch GUI
             from gui import main as gui_main
-            gui_main()
-            
-        elif args.mode == 'cli':
-            # Launch CLI
-            from cli import main as cli_main
-            cli_main()
-            
+            return gui_main() or 0
+
+        visualizer = EnhancedTSPVisualizer(mode=args.mode, seed=args.seed)
+        visualizer.generate_data(args.points)
+
+        if args.compare:
+            visualizer.compare_algorithms(args.compare, runs=args.runs,
+                                          refine=args.refine)
+            return 0
+
+        visualizer.set_algorithm(args.algorithm)
+
+        if args.animate:
+            visualizer.run_animation(save_video=args.save_video,
+                                     show_plot=not args.no_plot)
+            # The animation drives the loop directly, so produce a scored
+            # solution as well for export and reporting.
+            visualizer.solve_static(refine=args.refine)
         else:
-            # Simple mode
-            visualizer = EnhancedTSPVisualizer()
-            
-            # Generate data
-            visualizer.generate_data(args.points)
-            
-            if args.compare:
-                # Compare algorithms
-                visualizer.compare_algorithms(args.compare)
-            else:
-                # Single algorithm
-                visualizer.set_algorithm(args.algorithm)
-                
-                if args.animate:
-                    # Run animation
-                    visualizer.run_animation(
-                        save_video=args.save_video,
-                        show_plot=not args.no_plot
-                    )
-                else:
-                    # Static solve
-                    distance = visualizer.solve_static()
-                    
-                    if not args.no_plot:
-                        # Show static plot
-                        plt.figure(figsize=(10, 8))
-                        plt.scatter(visualizer.points[:, 0], visualizer.points[:, 1],
-                                  c='red', s=20, alpha=0.7, label='Points')
-                        
-                        if visualizer.vertices is not None:
-                            tour_x = np.append(visualizer.vertices[:, 0], visualizer.vertices[0, 0])
-                            tour_y = np.append(visualizer.vertices[:, 1], visualizer.vertices[0, 1])
-                            plt.plot(tour_x, tour_y, 'b-', linewidth=2, 
-                                   label=f'Tour (length: {distance:.6f})')
-                                   
-                        plt.title(f'TSP Solution - {visualizer.algorithm.name}')
-                        plt.legend()
-                        plt.axis('equal')
-                        plt.grid(True, alpha=0.3)
-                        plt.tight_layout()
-                        plt.show()
-                        
-                # Export if requested
-                if args.export:
-                    visualizer.export_results(args.export)
-                    
+            visualizer.solve_static(refine=args.refine)
+            if not args.no_plot or args.save_plot:
+                plot_solution(visualizer, save_plot=args.save_plot,
+                              show=not args.no_plot)
+
+        if args.export:
+            visualizer.export_results(args.export)
+
     except KeyboardInterrupt:
         print("\nInterrupted by user")
+        return 130
     except Exception as e:
         print(f"Error: {e}")
         return 1
-        
+
     return 0
 
+
 if __name__ == "__main__":
-    exit(main())
+    sys.exit(main())
