@@ -13,9 +13,9 @@ import numpy as np
 
 from backend import has_display, select_backend
 from config import Config
-from utils import (generate_clustered_points, tour_length,
+from utils import (attract_vertices, generate_clustered_points, tour_length,
                    export_data, init_circular_loop, smooth_loop,
-                   compute_convergence_metric, adaptive_parameters, SpatialIndex)
+                   compute_convergence_metric, adaptive_parameters)
 from algorithms import get_algorithm
 
 
@@ -299,23 +299,15 @@ class EnhancedTSPVisualizer:
             self.config.MIN_MOVE_RATE, self.config.MIN_SMOOTH_RATE
         )
         
-        # Assign points to nearest vertices
+        # Assign points to nearest vertices and pull each vertex toward the
+        # centroid of its catchment. This used to re-scan the assignment array
+        # once per vertex, which over the default 600 animation frames cost
+        # roughly seven times as much as the single scatter-add below.
         if len(self.points) > 0:
-            spatial_index = SpatialIndex(self.vertices)
-            _, nearest_indices = spatial_index.query_nearest(self.points)
-            
-            # Update vertices toward centroids
-            new_vertices = self.vertices.copy()
-            for v in range(len(self.vertices)):
-                assigned_points = self.points[nearest_indices == v]
-                if len(assigned_points) > 0:
-                    centroid = np.mean(assigned_points, axis=0)
-                    new_vertices[v] = (self.vertices[v] * (1 - move_rate) + 
-                                     centroid * move_rate)
-                                     
-            # Apply smoothing
+            new_vertices = attract_vertices(self.points, self.vertices, move_rate)
             self.vertices = smooth_loop(new_vertices, smooth_rate)
-            
+
+
     def _update_plots(self):
         """Update all visualization plots"""
         if not getattr(self, 'axes', None):

@@ -465,27 +465,12 @@ class TSPVisualizer:
             move_rate = self.sliders['move_rate'].val
             smooth_rate = self.sliders['smooth_rate'].val
             
-        # Assign points to nearest vertices
-        from utils import SpatialIndex, smooth_loop
-        
+        # Assign points to nearest vertices, then pull each vertex toward the
+        # centroid of its catchment.
+        from utils import attract_vertices, smooth_loop
+
         if len(self.points) > 0:
-            spatial_index = SpatialIndex(self.vertices)
-            _, nearest_indices = spatial_index.query_nearest(self.points)
-
-            # Accumulate every vertex's catchment in a single pass rather than
-            # rescanning the assignment array once per vertex.
-            sums = np.zeros_like(self.vertices)
-            counts = np.bincount(nearest_indices,
-                                 minlength=len(self.vertices)).astype(float)
-            np.add.at(sums, nearest_indices, self.points)
-
-            assigned = counts > 0
-            new_vertices = self.vertices.copy()
-            centroids = sums[assigned] / counts[assigned, None]
-            new_vertices[assigned] = (self.vertices[assigned] * (1 - move_rate)
-                                      + centroids * move_rate)
-
-            # Apply smoothing
+            new_vertices = attract_vertices(self.points, self.vertices, move_rate)
             self.vertices = smooth_loop(new_vertices, smooth_rate)
             
     def _update_plot(self):

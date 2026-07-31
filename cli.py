@@ -251,7 +251,7 @@ class TSPCommandLine:
 
     def _update_association_step(self, iteration):
         """Update association algorithm step"""
-        from utils import SpatialIndex, smooth_loop, adaptive_parameters
+        from utils import attract_vertices, smooth_loop, adaptive_parameters
 
         # Get adaptive parameters
         move_rate, smooth_rate = adaptive_parameters(
@@ -262,24 +262,8 @@ class TSPCommandLine:
             self.config.MIN_SMOOTH_RATE,
         )
 
-        # Assign points to vertices
         if len(self.points) > 0:
-            spatial_index = SpatialIndex(self.vertices)
-            _, nearest_indices = spatial_index.query_nearest(self.points)
-
-            # Accumulate every vertex's catchment in a single pass.
-            sums = np.zeros_like(self.vertices)
-            counts = np.bincount(nearest_indices,
-                                 minlength=len(self.vertices)).astype(float)
-            np.add.at(sums, nearest_indices, self.points)
-
-            assigned = counts > 0
-            new_vertices = self.vertices.copy()
-            centroids = sums[assigned] / counts[assigned, None]
-            new_vertices[assigned] = (self.vertices[assigned] * (1 - move_rate)
-                                      + centroids * move_rate)
-
-            # Smooth
+            new_vertices = attract_vertices(self.points, self.vertices, move_rate)
             self.vertices = smooth_loop(new_vertices, smooth_rate)
 
     def export_solution(self, filename: str):

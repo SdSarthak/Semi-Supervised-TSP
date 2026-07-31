@@ -69,6 +69,117 @@ def euclidean_distance_matrix(points1: np.ndarray, points2: np.ndarray) -> np.nd
     """Compute euclidean distance matrix between two sets of points"""
     return cdist(points1, points2, metric='euclidean')
 
+
+def validate_points(points, name: str = "points") -> np.ndarray:
+    """Coerce input to an ``(n, 2)`` float array, rejecting unusable data.
+
+    NaN and infinite coordinates do not raise anywhere downstream: the KD-tree
+    returns an out-of-range neighbour index, ``np.argmin`` picks the first NaN
+    instead of the nearest point, and every reported tour length comes back as
+    NaN. The result looks like a solution but is meaningless, and ``json.dump``
+    then writes a literal ``NaN`` that strict JSON parsers reject. Catching it
+    at the boundary turns a silent wrong answer into an actionable error.
+
+    Raises:
+        ValueError: if the input is not a rectangular ``(n, 2)`` array of
+            finite numbers.
+    """
+    try:
+        array = np.asarray(points, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{name} must be a rectangular array of numeric (x, y) pairs: {exc}"
+        ) from exc
+
+    if array.ndim != 2 or array.shape[1] != 2:
+        raise ValueError(
+            f"{name} must be an (n, 2) array of 2-D coordinates, got shape {array.shape}"
+        )
+
+    if array.size:
+        finite = np.isfinite(array)
+        if not finite.all():
+            bad = np.flatnonzero(~finite.all(axis=1))
+            preview = ', '.join(str(int(i)) for i in bad[:5])
+            more = '' if len(bad) <= 5 else f" (and {len(bad) - 5} more)"
+            raise ValueError(
+                f"{name} contains {len(bad)} row(s) with NaN or infinite "
+                f"coordinates at index {preview}{more}; clean the input first"
+            )
+
+    return array
+
+
+def data_bounds(points: np.ndarray, margin: float = 0.05):
+    """Bounding box and characteristic scale of a point set.
+
+    The elastic-loop solver was written against the unit square and hard-coded
+    a ``[0.02, 0.98]`` clip, a radius of ``0.35`` and edge thresholds in
+    absolute units. Fed real coordinates -- TSPLIB instances, latitude and
+    longitude, anything not pre-normalised -- those constants either collapse
+    the loop into a corner or make every edge look short. Deriving them from
+    the data makes the solver behave the same at any coordinate scale.
+
+    Args:
+        points: ``(n, 2)`` array of data points.
+        margin: padding around the bounding box, as a fraction of the scale.
+
+    Returns:
+        ``(lo, hi, scale)`` where ``lo``/``hi`` are ``(2,)`` padded corners and
+        ``scale`` is the longer side of the unpadded box (1.0 for degenerate
+        input, so callers never divide by zero).
+    """
+    points = np.asarray(points, dtype=float)
+    if points.size == 0:
+        return np.zeros(2), np.ones(2), 1.0
+
+    lo = points.min(axis=0)
+    hi = points.max(axis=0)
+    scale = float(np.max(hi - lo))
+    if not np.isfinite(scale) or scale <= 0.0:
+        scale = 1.0
+
+    pad = float(margin) * scale
+    return lo - pad, hi + pad, scale
+
+
+def attract_vertices(points: np.ndarray, vertices: np.ndarray,
+                     move_rate: float) -> np.ndarray:
+    """Pull every loop vertex toward the centroid of the points nearest to it.
+
+    This is the one step shared by the association solver and by all three
+    animated front ends, which each kept their own copy. Catchments are
+    accumulated in a single scatter-add rather than by scanning the assignment
+    array once per vertex, which is what the animation loop used to do.
+
+    Args:
+        points: ``(n, 2)`` data points.
+        vertices: ``(m, 2)`` loop vertices.
+        move_rate: fraction of the way to move each vertex toward its centroid.
+
+    Returns:
+        A new ``(m, 2)`` array; ``vertices`` is never modified in place.
+    """
+    points = np.asarray(points, dtype=float)
+    vertices = np.asarray(vertices, dtype=float)
+
+    if len(points) == 0 or len(vertices) == 0:
+        return vertices.copy()
+
+    _, nearest = SpatialIndex(vertices).query_nearest(points)
+    nearest = np.asarray(nearest, dtype=int)
+
+    sums = np.zeros_like(vertices)
+    counts = np.bincount(nearest, minlength=len(vertices)).astype(float)
+    np.add.at(sums, nearest, points)
+
+    assigned = counts > 0
+    moved = vertices.copy()
+    centroids = sums[assigned] / counts[assigned, None]
+    moved[assigned] = (vertices[assigned] * (1.0 - move_rate)
+                       + centroids * move_rate)
+    return moved
+
 def tour_length(tour: np.ndarray) -> float:
     """Calculate total length of a closed tour given as an array of points"""
     tour = np.asarray(tour, dtype=float)
@@ -379,18 +490,24 @@ def generate_clustered_points(n_points: int, n_clusters: int = 5,
 
 def init_circular_loop(n_vertices: int, center: Tuple[float, float] = (0.5, 0.5),
                        radius: float = 0.35, noise_std: float = 0.02,
-                       seed: SeedLike = None) -> np.ndarray:
+                       seed: SeedLike = None, bounds=None) -> np.ndarray:
     """Initialize a noisy circular loop.
 
     Args:
         n_vertices: number of loop vertices.
-        center: loop centre in unit-square coordinates.
+        center: loop centre, in the same units as the data.
         radius: nominal loop radius.
         noise_std: magnitude of the radial and positional jitter.
         seed: seed or Generator for reproducible output.
+        bounds: optional ``(lo, hi)`` pair of ``(2,)`` corners to clip to.
+            Defaults to the unit square; pass the data's own bounding box when
+            the coordinates are not normalised, otherwise the whole loop is
+            clipped into a corner of the unit square (see :func:`data_bounds`).
     """
     if n_vertices < 3:
         raise ValueError("a loop needs at least three vertices")
+    if not np.isfinite(radius) or radius <= 0:
+        raise ValueError("radius must be a positive, finite number")
 
     rng = as_generator(seed)
 
@@ -403,25 +520,38 @@ def init_circular_loop(n_vertices: int, center: Tuple[float, float] = (0.5, 0.5)
 
     # Add random jitter
     vertices += noise_std * rng.standard_normal((n_vertices, 2))
-    return np.clip(vertices, COORD_MIN, COORD_MAX)
 
-def calculate_adaptive_vertex_count(data_points: np.ndarray, min_vertices: int = 60, 
+    if bounds is None:
+        return np.clip(vertices, COORD_MIN, COORD_MAX)
+
+    lo, hi = bounds
+    return np.clip(vertices, np.asarray(lo, dtype=float), np.asarray(hi, dtype=float))
+
+def calculate_adaptive_vertex_count(data_points: np.ndarray, min_vertices: int = 60,
                                    max_vertices: int = 300, density_factor: float = 0.4) -> int:
-    """Calculate optimal number of vertices based on data point density"""
+    """Calculate optimal number of vertices based on data point density.
+
+    The spread term is normalised by the data's own extent. Taken in absolute
+    units it grew with the coordinate scale, so the same point cloud expressed
+    in metres instead of kilometres asked for a different loop resolution.
+    """
+    data_points = np.asarray(data_points, dtype=float)
     n_points = len(data_points)
-    
+
     # Base number of vertices proportional to data points
     adaptive_count = int(n_points * density_factor)
-    
+
     # Add extra vertices for complex data distributions
     if n_points > 10:
-        # Calculate data spread
-        std_x = np.std(data_points[:, 0])
-        std_y = np.std(data_points[:, 1])
+        extent = float(np.max(data_points.max(axis=0) - data_points.min(axis=0)))
+        if not np.isfinite(extent) or extent <= 0.0:
+            extent = 1.0
+        std_x = np.std(data_points[:, 0]) / extent
+        std_y = np.std(data_points[:, 1]) / extent
         complexity_factor = (std_x + std_y) * 2  # Higher spread = more complexity
-        
+
         adaptive_count += int(complexity_factor * 50)
-    
+
     # Clamp to min/max bounds
     return max(min_vertices, min(adaptive_count, max_vertices))
 
@@ -606,25 +736,33 @@ def load_data(filename: str) -> Tuple[np.ndarray, np.ndarray, float]:
 
 
 def load_points(filename: str) -> np.ndarray:
-    """Load a set of 2-D points from a JSON, CSV or whitespace-delimited file"""
+    """Load a set of 2-D points from a JSON, CSV or whitespace-delimited file.
+
+    Raises:
+        FileNotFoundError: if the file does not exist.
+        ValueError: if the file is empty, is not two columns of coordinates,
+            or contains NaN/infinite values.
+    """
     extension = os.path.splitext(filename)[1].lower()
 
     if extension == '.json':
         with open(filename, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+            try:
+                data = json.load(f)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{filename} is not valid JSON: {exc}") from exc
         if isinstance(data, dict):
             if 'points' not in data:
                 raise ValueError(f"{filename} has no 'points' field")
-            points = np.asarray(data['points'], dtype=float)
-        else:
-            points = np.asarray(data, dtype=float)
+            data = data['points']
+        points = np.asarray(data, dtype=float) if data else np.empty((0, 2))
     elif extension == '.csv':
-        points = np.loadtxt(filename, delimiter=',', dtype=float)
+        points = np.loadtxt(filename, delimiter=',', dtype=float, ndmin=2)
     else:
-        points = np.loadtxt(filename, dtype=float)
+        points = np.loadtxt(filename, dtype=float, ndmin=2)
 
     points = np.atleast_2d(points)
-    if points.ndim != 2 or points.shape[1] != 2:
-        raise ValueError(f"{filename} must contain two columns of coordinates")
+    if points.size == 0:
+        raise ValueError(f"{filename} contains no points")
 
-    return points
+    return validate_points(points, name=filename)

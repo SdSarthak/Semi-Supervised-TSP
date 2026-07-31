@@ -29,10 +29,12 @@ from typing import List, Optional, Sequence
 import numpy as np
 from sklearn.cluster import KMeans
 
-from utils import (SpatialIndex, adaptive_smooth_loop, calculate_adaptive_vertex_count,
+from utils import (adaptive_smooth_loop, attract_vertices,
+                   calculate_adaptive_vertex_count, data_bounds,
                    init_circular_loop, optimize_vertex_distribution,
                    order_points_along_loop, remove_redundant_vertices, resample_curve,
-                   subdivide_vertices, tour_length, tour_length_of_indices, two_opt_refine)
+                   subdivide_vertices, tour_length, tour_length_of_indices,
+                   two_opt_refine, validate_points)
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +119,28 @@ class TSPAlgorithm:
         points = np.asarray(points, dtype=float)
         return points[self.solve_tour(points)]
 
+    def _tour_from_loop(self, points: np.ndarray, loop: np.ndarray) -> np.ndarray:
+        """Read a tour off a fitted loop, falling back when the loop is unusable.
+
+        A loop needs at least two distinct vertices before "where does this
+        point project onto it" means anything. ``ClusteringTSP(n_clusters=1)``
+        produces a single vertex and used to crash in projection; a loop whose
+        vertices have all collapsed onto one another carries no ordering at
+        all, so every point would project to arc position zero and the tour
+        would come out in whatever order ``lexsort`` happened to pick.
+        """
+        points = np.asarray(points, dtype=float)
+        if len(points) <= 2:
+            return np.arange(len(points))
+
+        loop = np.asarray(loop, dtype=float)
+        if len(loop) < 2 or tour_length(loop) <= 0.0:
+            logger.debug("%s produced a degenerate loop (%d vertices); "
+                         "falling back to greedy construction", self.name, len(loop))
+            return nearest_neighbor_tour(points)
+
+        return order_points_along_loop(points, loop)
+
     def solve(self, points: np.ndarray) -> np.ndarray:
         """Solve TSP and return the ordered array of 2-D coordinates.
 
@@ -135,13 +159,17 @@ class TSPAlgorithm:
         Args:
             points: ``(n, 2)`` array of data points.
             refine: polish the resulting tour with 2-opt before reporting.
+
+        Raises:
+            ValueError: if ``points`` is not an ``(n, 2)`` array of finite
+                coordinates. NaN input otherwise yields a NaN tour length and
+                an arbitrary ordering, which looks like a result but is not.
         """
-        points = np.asarray(points, dtype=float)
+        points = validate_points(points)
 
         start = time.perf_counter()
         loop = self.solve_loop(points) if self.produces_loop else None
-        tour = (order_points_along_loop(points, loop)
-                if loop is not None and len(points) > 2
+        tour = (self._tour_from_loop(points, loop) if loop is not None
                 else self.solve_tour(points))
         if refine and len(points) > 3:
             tour = two_opt_refine(points, tour)
@@ -421,6 +449,11 @@ class AssociationTSP(TSPAlgorithm):
     select it as their nearest vertex, then relaxed by curvature-aware Laplacian
     smoothing. Repeating that contracts the loop onto the data. The tour is read
     off by ordering the points along the fitted loop.
+
+    Every length in the fit -- the starting radius, the clip box, the
+    subdivision threshold, the crowding distance -- is expressed as a fraction
+    of the data's own extent, so the solver behaves identically whether the
+    coordinates are normalised or raw.
     """
 
     produces_loop = True
@@ -481,54 +514,50 @@ class AssociationTSP(TSPAlgorithm):
             return points
 
         n_vertices = self._resolve_vertex_count(points)
-        vertices = init_circular_loop(n_vertices, seed=self._rng)
+
+        # Anchor the loop to the data instead of to the unit square. With a
+        # fixed centre of (0.5, 0.5) and a [0.02, 0.98] clip, any point set
+        # that is not already normalised had its whole loop pinned into one
+        # corner of the unit square, so the "tour" was junk.
+        lo, hi, scale = data_bounds(points, margin=0.05)
+        center = (lo + hi) / 2.0
+        vertices = init_circular_loop(n_vertices,
+                                      center=(float(center[0]), float(center[1])),
+                                      radius=0.35 * scale,
+                                      noise_std=0.02 * scale,
+                                      seed=self._rng,
+                                      bounds=(lo, hi))
 
         for iteration in range(self.max_iterations):
             progress = iteration / self.max_iterations
             move_rate = max(self.initial_move_rate * (1 - progress), self.min_move_rate)
             smooth_rate = max(self.initial_smooth_rate * (1 - progress), self.min_smooth_rate)
 
-            vertices = self._attract_step(points, vertices, move_rate)
+            vertices = attract_vertices(points, vertices, move_rate)
 
             for _ in range(self.smoothing_iterations):
                 vertices = adaptive_smooth_loop(vertices, smooth_rate * 0.5,
                                                 curvature_weight=0.3)
 
             if self.reoptimize_every > 0 and iteration > 0 and iteration % self.reoptimize_every == 0:
-                vertices = self._reoptimize(vertices)
+                vertices = self._reoptimize(vertices, scale)
                 logger.debug("Iteration %d: loop resized to %d vertices",
                              iteration, len(vertices))
 
-            vertices = np.clip(vertices, 0.02, 0.98)
+            vertices = np.clip(vertices, lo, hi)
 
         self.last_vertex_count = len(vertices)
         return vertices
 
-    @staticmethod
-    def _attract_step(points: np.ndarray, vertices: np.ndarray,
-                      move_rate: float) -> np.ndarray:
-        """Pull each vertex toward the centroid of the points assigned to it"""
-        _, nearest = SpatialIndex(vertices).query_nearest(points)
+    def _reoptimize(self, vertices: np.ndarray, scale: float = 1.0) -> np.ndarray:
+        """Subdivide long edges, drop crowded vertices, respace the loop.
 
-        # Accumulate the centroid of every vertex's catchment in one pass
-        # instead of scanning the assignment array once per vertex.
-        sums = np.zeros_like(vertices)
-        counts = np.bincount(nearest, minlength=len(vertices)).astype(float)
-        np.add.at(sums, nearest, points)
-
-        assigned = counts > 0
-        centroids = np.zeros_like(vertices)
-        centroids[assigned] = sums[assigned] / counts[assigned, None]
-
-        moved = vertices.copy()
-        moved[assigned] = (vertices[assigned] * (1 - move_rate)
-                           + centroids[assigned] * move_rate)
-        return moved
-
-    def _reoptimize(self, vertices: np.ndarray) -> np.ndarray:
-        """Subdivide long edges, drop crowded vertices, respace the loop"""
-        vertices = subdivide_vertices(vertices, self.subdivision_threshold)
-        vertices = remove_redundant_vertices(vertices, min_distance=0.008)
+        Both thresholds are relative to the data extent; as absolute numbers
+        they subdivided every edge on large-coordinate data and none at all on
+        small-coordinate data.
+        """
+        vertices = subdivide_vertices(vertices, self.subdivision_threshold * scale)
+        vertices = remove_redundant_vertices(vertices, min_distance=0.008 * scale)
         if len(vertices) > self.max_vertices:
             vertices = resample_curve(vertices, self.max_vertices)
         return optimize_vertex_distribution(vertices)
@@ -537,7 +566,7 @@ class AssociationTSP(TSPAlgorithm):
         points = np.asarray(points, dtype=float)
         if len(points) <= 3:
             return np.arange(len(points))
-        return order_points_along_loop(points, self.solve_loop(points))
+        return self._tour_from_loop(points, self.solve_loop(points))
 
 
 class ClusteringTSP(TSPAlgorithm):
@@ -583,7 +612,7 @@ class ClusteringTSP(TSPAlgorithm):
         points = np.asarray(points, dtype=float)
         if len(points) <= 3:
             return np.arange(len(points))
-        return order_points_along_loop(points, self.solve_loop(points))
+        return self._tour_from_loop(points, self.solve_loop(points))
 
 
 ALGORITHMS = {
