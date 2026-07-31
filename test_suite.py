@@ -2,12 +2,12 @@
 Comprehensive test suite for Semi-Supervised TSP Visualizer
 """
 
-import unittest
-import numpy as np
-import tempfile
+import importlib
 import os
-import json
-from unittest.mock import patch
+import tempfile
+import unittest
+
+import numpy as np
 
 from config import Config
 from utils import (euclidean_distance_matrix, tour_length, smooth_loop,
@@ -17,6 +17,9 @@ from utils import (euclidean_distance_matrix, tour_length, smooth_loop,
 from algorithms import (get_algorithm, NearestNeighborTSP, TwoOptTSP,
                        GeneticTSP, SimulatedAnnealingTSP, AssociationTSP,
                        ClusteringTSP)
+
+# Every test here is deterministic and needs no downloaded data: point sets
+# are either hand-written or generated from an explicit seed.
 
 class TestConfig(unittest.TestCase):
     """Test configuration validation"""
@@ -73,13 +76,34 @@ class TestUtils(unittest.TestCase):
         
     def test_generate_clustered_points(self):
         """Test point generation"""
-        points = generate_clustered_points(100, 3, 0.05, 0.6)
-        
+        points = generate_clustered_points(100, 3, 0.05, 0.6, seed=0)
+
         self.assertEqual(len(points), 100)
         self.assertEqual(points.shape[1], 2)
         self.assertTrue(np.all(points >= 0.02))
         self.assertTrue(np.all(points <= 0.98))
-        
+
+    def test_generate_clustered_points_is_seed_reproducible(self):
+        """The same seed gives the same points; a different seed does not"""
+        first = generate_clustered_points(50, 3, 0.05, 0.6, seed=123)
+        again = generate_clustered_points(50, 3, 0.05, 0.6, seed=123)
+        other = generate_clustered_points(50, 3, 0.05, 0.6, seed=124)
+
+        np.testing.assert_array_equal(first, again)
+        self.assertFalse(np.array_equal(first, other))
+
+    def test_generate_clustered_points_leaves_global_rng_alone(self):
+        """Generating data must not reseed numpy's global RNG for everyone else"""
+        np.random.seed(7)
+        expected = np.random.rand(3)
+
+        np.random.seed(7)
+        generate_clustered_points(50, 3, 0.05, 0.6, seed=99)
+        actual = np.random.rand(3)
+
+        np.testing.assert_array_equal(expected, actual)
+
+
     def test_init_circular_loop(self):
         """Test circular loop initialization"""
         vertices = init_circular_loop(8)
@@ -233,20 +257,28 @@ class TestAlgorithms(unittest.TestCase):
         self.assertGreater(tour_length(tour), 0)
         
     def test_association_tsp(self):
-        """Test association algorithm"""
+        """An explicit vertex count is honoured and shapes the fitted loop"""
         algo = AssociationTSP(n_vertices=8, max_iterations=5)
-        tour = algo.solve(self.random_points)
-        
-        self.assertEqual(len(tour), 8)  # Should return n_vertices points
-        self.assertEqual(tour.shape[1], 2)
-        
+        loop = algo.solve(self.random_points)
+
+        self.assertEqual(len(loop), 8)  # Explicit n_vertices wins over adaptive sizing
+        self.assertEqual(loop.shape[1], 2)
+
+    def test_association_adaptive_vertex_count(self):
+        """Asking for adaptive sizing overrides the explicit vertex count"""
+        algo = AssociationTSP(n_vertices=8, max_iterations=5,
+                              adaptive_vertices=True, min_vertices=40)
+        loop = algo.solve(self.random_points)
+
+        self.assertGreaterEqual(len(loop), 40)
+
     def test_clustering_tsp(self):
-        """Test clustering algorithm"""
-        algo = ClusteringTSP(n_clusters=5)
-        tour = algo.solve(self.random_points)
-        
-        self.assertEqual(len(tour), 5)  # Should return n_clusters points
-        self.assertEqual(tour.shape[1], 2)
+        """Clustering interpolates the ordered centres into a finer loop"""
+        algo = ClusteringTSP(n_clusters=5, n_interpolated_vertices=40)
+        loop = algo.solve(self.random_points)
+
+        self.assertEqual(len(loop), 40)
+        self.assertEqual(loop.shape[1], 2)
 
 class TestExportImport(unittest.TestCase):
     """Test data export and import functionality"""
@@ -303,23 +335,23 @@ class TestIntegration(unittest.TestCase):
     def test_full_pipeline(self):
         """Test complete pipeline from data generation to solution"""
         # Generate data
-        points = generate_clustered_points(20, 3, 0.05, 0.6)
-        
+        points = generate_clustered_points(20, 3, 0.05, 0.6, seed=5)
+
         # Test multiple algorithms with appropriate parameters
         algorithms = [
             ('nearest_neighbor', {}),
-            ('association', {'n_vertices': 10}),
+            ('association', {'n_vertices': 10, 'max_iterations': 20}),
             ('clustering', {'n_clusters': 5})
         ]
-        
+
         for algo_name, kwargs in algorithms:
             with self.subTest(algorithm=algo_name):
                 algo = get_algorithm(algo_name, **kwargs)
                 tour = algo.solve(points)
-                
+
                 self.assertGreater(len(tour), 0)
                 self.assertEqual(tour.shape[1], 2)
-                
+
                 # Tour length should be positive
                 length = tour_length(tour)
                 self.assertGreater(length, 0)
@@ -348,7 +380,6 @@ class TestPerformance(unittest.TestCase):
 
 def run_tests():
     """Run all tests"""
-    # Create test suite
     test_classes = [
         TestConfig,
         TestUtils,
@@ -356,21 +387,30 @@ def run_tests():
         TestAlgorithms,
         TestExportImport,
         TestTimer,
-        TestIntegration
+        TestIntegration,
     ]
-    
+
+    loader = unittest.TestLoader()
     suite = unittest.TestSuite()
-    
+
     for test_class in test_classes:
-        tests = unittest.TestLoader().loadTestsFromTestCase(test_class)
-        suite.addTests(tests)
-        
-    # Run tests
+        suite.addTests(loader.loadTestsFromTestCase(test_class))
+
+    # Pull in the sibling test modules too, so `python test_suite.py` runs
+    # everything rather than silently covering a subset.
+    for module_name in ('test_tours', 'test_interfaces'):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        suite.addTests(loader.loadTestsFromModule(module))
+
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
-    
+
     return result.wasSuccessful()
+
 
 if __name__ == '__main__':
     success = run_tests()
-    exit(0 if success else 1)
+    raise SystemExit(0 if success else 1)
