@@ -398,7 +398,7 @@ def run_tests():
 
     # Pull in the sibling test modules too, so `python test_suite.py` runs
     # everything rather than silently covering a subset.
-    for module_name in ('test_tours', 'test_interfaces'):
+    for module_name in ('test_tours', 'test_interfaces', 'test_robustness'):
         try:
             module = importlib.import_module(module_name)
         except ImportError:

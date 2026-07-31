@@ -5,6 +5,7 @@ Utility functions for Semi-Supervised TSP Visualizer
 import json
 import os
 import time
+import warnings
 from typing import Tuple, Optional, Sequence, Union
 
 import numpy as np
@@ -756,10 +757,13 @@ def load_points(filename: str) -> np.ndarray:
                 raise ValueError(f"{filename} has no 'points' field")
             data = data['points']
         points = np.asarray(data, dtype=float) if data else np.empty((0, 2))
-    elif extension == '.csv':
-        points = np.loadtxt(filename, delimiter=',', dtype=float, ndmin=2)
     else:
-        points = np.loadtxt(filename, dtype=float, ndmin=2)
+        delimiter = ',' if extension == '.csv' else None
+        with warnings.catch_warnings():
+            # An empty file is reported below with a clearer message than
+            # numpy's "input contained no data" warning.
+            warnings.filterwarnings('ignore', message='loadtxt: input contained no data')
+            points = np.loadtxt(filename, delimiter=delimiter, dtype=float, ndmin=2)
 
     points = np.atleast_2d(points)
     if points.size == 0:
